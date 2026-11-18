@@ -1,17 +1,46 @@
 # AI Memory Adapter
 
-用于 AI 大脑项目的记忆层实现，解决 ChatGPT 会话上下文碎片化问题。
+🦀 **Rust-based** memory layer for AI Brain Architecture project.
 
-## 架构
+## Problem
+
+ChatGPT sessions have no persistent memory → context fragmentation → frequent restarts.
+
+## Solution
 
 ```
-Memory Adapter (接口层)
-├── Storage (SQLite + 向量库)
-├── Context Injection (智能上下文注入)
-└── Pruning (Ebbinghaus 遗忘)
+Memory Adapter (Interface)
+├── Storage (SQLite + Vector DB)
+├── Context Injection (Smart context loading)
+└── Pruning (Ebbinghaus forgetting curve)
 ```
 
-## 开发指南
+## Architecture
 
-本项目按照 AI-STD-001 规范开发，由 ChatGPT 在远程服务器 43.138.133.238 上执行。
+```rust
+pub trait MemoryAdapter {
+    async fn store(&self, entry: MemoryEntry) -> Result<EntryId>;
+    async fn query(&self, query: &Query) -> Result<Vec<MemoryEntry>>;
+    async fn inject_context(&self, session_id: &str) -> Result<Context>;
+    async fn prune(&self, retention_policy: &RetentionPolicy) -> Result<PruneReport>;
+}
+```
 
+## Development
+
+Developed by ChatGPT on remote server `43.138.133.238` following AI-STD-001 spec.
+
+## Tech Stack
+
+- **Language**: Rust 2021 edition
+- **Database**: SQLx + SQLite
+- **Vector DB**: Qdrant (default) / FAISS (optional)
+- **Async Runtime**: Tokio
+
+## Quick Start
+
+```bash
+cargo build --release
+cargo test
+./target/release/memory-adapter
+```
