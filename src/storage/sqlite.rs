@@ -10,6 +10,7 @@ use sqlx::{
 use uuid::Uuid;
 
 use crate::adapter::{AdapterError, AdapterResult, MemoryAdapter, MemoryEntry, Query};
+use crate::pruning::{EbbinghausPolicy, PruneReport};
 
 /// SQLite implementation of MemoryAdapter.
 pub struct SqliteStorage {
@@ -64,6 +65,60 @@ impl SqliteStorage {
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Prune memories using an Ebbinghaus retention policy.
+    pub async fn prune_ebbinghaus(
+        &self,
+        policy: &EbbinghausPolicy,
+        evaluated_at: DateTime<Utc>,
+    ) -> AdapterResult<PruneReport> {
+        policy.validate()?;
+
+        let mut tx = self.pool.begin().await.map_err(storage_error)?;
+
+        let rows = sqlx::query(
+            "SELECT id, session_id, content, embedding_json, metadata_json,
+                    created_at, access_count, last_accessed
+             FROM memories",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(storage_error)?;
+
+        let mut report = PruneReport {
+            entries_examined: rows.len(),
+            entries_deleted: 0,
+            entries_retained: 0,
+            prune_threshold: policy.prune_threshold,
+            evaluated_at,
+        };
+
+        for row in rows {
+            let entry = decode_entry(&row)?;
+
+            if policy.should_prune(&entry, evaluated_at)? {
+                let result = sqlx::query("DELETE FROM memories WHERE id = ?")
+                    .bind(entry.id.to_string())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(storage_error)?;
+
+                if result.rows_affected() != 1 {
+                    return Err(AdapterError::Storage(
+                        "expected exactly one row to be deleted during Ebbinghaus pruning".into(),
+                    ));
+                }
+
+                report.entries_deleted += 1;
+            } else {
+                report.entries_retained += 1;
+            }
+        }
+
+        tx.commit().await.map_err(storage_error)?;
+
+        Ok(report)
     }
 }
 
