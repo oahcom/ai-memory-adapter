@@ -1,5 +1,5 @@
 //! AI Memory Adapter
-//! 
+//!
 //! Core memory layer for AI Brain project, solving ChatGPT context fragmentation.
 
 use anyhow::Result;

@@ -6,6 +6,7 @@ authors = ["AI Memory Brain Architecture Team"]
 
 [dependencies]
 tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
@@ -16,7 +17,6 @@ tracing-subscriber = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
 
-# Vector DB
 faiss = { version = "0.12", optional = true }
 qdrant-client = { version = "1.12", optional = true }
 
