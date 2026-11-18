@@ -3,4 +3,5 @@
 //! Core memory abstraction for the AI Brain project.
 
 pub mod adapter;
+pub mod context;
 pub mod storage;
