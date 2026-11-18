@@ -1,0 +1,33 @@
+[package]
+name = "ai-memory-adapter"
+version = "0.1.0"
+edition = "2021"
+authors = ["AI Memory Brain Architecture Team"]
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+# Vector DB
+faiss = { version = "0.12", optional = true }
+qdrant-client = { version = "1.12", optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[features]
+default = ["qdrant"]
+faiss-backend = ["faiss"]
+qdrant = ["qdrant-client"]
+
+[[bin]]
+name = "memory-adapter"
+path = "src/main.rs"
