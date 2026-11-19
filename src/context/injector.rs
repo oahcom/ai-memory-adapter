@@ -125,14 +125,22 @@ impl<'a> ContextInjector<'a> {
         })
     }
     /// Retrieve relevant memories across sessions, restricted to one work item.
-    pub async fn inject_work_item(&self, work_item_id: &str, query_text: &str) -> AdapterResult<ContextResult> {
+    pub async fn inject_work_item(
+        &self,
+        work_item_id: &str,
+        query_text: &str,
+    ) -> AdapterResult<ContextResult> {
         if work_item_id.trim().is_empty() || query_text.trim().is_empty() {
-            return Err(AdapterError::Validation("work_item_id and query_text must not be empty".into()));
+            return Err(AdapterError::Validation(
+                "work_item_id and query_text must not be empty".into(),
+            ));
         }
         let query = Query {
-            text: query_text.to_owned(), session_id: None,
+            text: query_text.to_owned(),
+            session_id: None,
             work_item_id: Some(work_item_id.to_owned()),
-            limit: self.config.max_entries, threshold: self.config.min_score,
+            limit: self.config.max_entries,
+            threshold: self.config.min_score,
         };
         let memories = self.adapter.query(&query).await?;
         let mut text = String::new();
@@ -147,12 +155,18 @@ impl<'a> ContextInjector<'a> {
                 entries_omitted += 1;
                 continue;
             }
-            if !text.is_empty() { text.push('\n'); }
+            if !text.is_empty() {
+                text.push('\n');
+            }
             text.push_str(&line);
             chars_used += required_chars;
             entries_included += 1;
         }
-        Ok(ContextResult { text, entries_included, entries_omitted, chars_used })
+        Ok(ContextResult {
+            text,
+            entries_included,
+            entries_omitted,
+            chars_used,
+        })
     }
-
 }
