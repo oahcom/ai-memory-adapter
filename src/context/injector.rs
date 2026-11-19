@@ -162,9 +162,10 @@ impl<'a> ContextInjector<'a> {
             let encoded_work_item_id = serde_json::to_string(work_item_id).map_err(|error| {
                 AdapterError::Storage(format!("failed to encode Work Item ID: {error}"))
             })?;
-            let encoded_session_id = serde_json::to_string(&memory.session_id).map_err(|error| {
-                AdapterError::Storage(format!("failed to encode session ID: {error}"))
-            })?;
+            let encoded_session_id =
+                serde_json::to_string(&memory.session_id).map_err(|error| {
+                    AdapterError::Storage(format!("failed to encode session ID: {error}"))
+                })?;
             let encoded_content = serde_json::to_string(&memory.content).map_err(|error| {
                 AdapterError::Storage(format!("failed to encode memory content: {error}"))
             })?;
@@ -197,3 +198,5 @@ impl<'a> ContextInjector<'a> {
         })
     }
 }
+
+[executed on device: MS-QSZMHWTHUAJW (5cf15972-dd57-4115-827c-7c69eeec2bab)]
