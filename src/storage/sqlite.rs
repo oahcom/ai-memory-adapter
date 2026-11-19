@@ -29,6 +29,98 @@ pub struct SqliteStorage {
     pool: SqlitePool,
 }
 
+// Serialize schema creation and migration across independent processes. BEGIN IMMEDIATE
+// acquires SQLite's reserved write lock before inspecting the schema, so a second
+// opener re-checks the column only after the first migration has committed.
+async fn initialize_schema(pool: &SqlitePool) -> AdapterResult<()> {
+    let mut connection = pool.acquire().await.map_err(storage_error)?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *connection)
+        .await
+        .map_err(storage_error)?;
+
+    let migration = async {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY NOT NULL,
+                session_id TEXT NOT NULL,
+                work_item_id TEXT,
+                content TEXT NOT NULL,
+                embedding_json TEXT,
+                metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                access_count INTEGER NOT NULL CHECK (access_count >= 0),
+                last_accessed TEXT NOT NULL
+            )",
+        )
+        .execute(&mut *connection)
+        .await
+        .map_err(storage_error)?;
+
+        // This check intentionally happens after BEGIN IMMEDIATE. Another process
+        // may have migrated while this connection was waiting for the write lock.
+        let columns = sqlx::query("PRAGMA table_info(memories)")
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(storage_error)?;
+        let has_work_item_id = columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == "work_item_id");
+        if !has_work_item_id {
+            sqlx::query("ALTER TABLE memories ADD COLUMN work_item_id TEXT")
+                .execute(&mut *connection)
+                .await
+                .map_err(storage_error)?;
+        }
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_memories_work_item_last_accessed_id ON memories(work_item_id, last_accessed DESC, id DESC)")
+            .execute(&mut *connection)
+            .await
+            .map_err(storage_error)?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memories_session_created
+             ON memories(session_id, created_at DESC)",
+        )
+        .execute(&mut *connection)
+        .await
+        .map_err(storage_error)?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at)")
+            .execute(&mut *connection)
+            .await
+            .map_err(storage_error)?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memories_session_last_accessed_id
+             ON memories(session_id, last_accessed DESC, id DESC)",
+        )
+        .execute(&mut *connection)
+        .await
+        .map_err(storage_error)?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memories_last_accessed_id
+             ON memories(last_accessed DESC, id DESC)",
+        )
+        .execute(&mut *connection)
+        .await
+        .map_err(storage_error)?;
+        Ok::<(), AdapterError>(())
+    }
+    .await;
+
+    match migration {
+        Ok(()) => {
+            sqlx::query("COMMIT")
+                .execute(&mut *connection)
+                .await
+                .map_err(storage_error)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+            Err(error)
+        }
+    }
+}
+
 impl SqliteStorage {
     pub async fn open(path: impl AsRef<Path>) -> AdapterResult<Self> {
         let options = SqliteConnectOptions::new()
@@ -43,67 +135,7 @@ impl SqliteStorage {
             .await
             .map_err(storage_error)?;
 
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS memories (
-                id TEXT PRIMARY KEY NOT NULL,
-                session_id TEXT NOT NULL,
-                work_item_id TEXT,
-                content TEXT NOT NULL,
-                embedding_json TEXT,
-                metadata_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                access_count INTEGER NOT NULL CHECK (access_count >= 0),
-                last_accessed TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .map_err(storage_error)?;
-
-        let columns = sqlx::query("PRAGMA table_info(memories)")
-            .fetch_all(&pool)
-            .await
-            .map_err(storage_error)?;
-        let has_work_item_id = columns
-            .iter()
-            .any(|row| row.get::<String, _>("name") == "work_item_id");
-        if !has_work_item_id {
-            sqlx::query("ALTER TABLE memories ADD COLUMN work_item_id TEXT")
-                .execute(&pool)
-                .await
-                .map_err(storage_error)?;
-        }
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_memories_work_item_last_accessed_id ON memories(work_item_id, last_accessed DESC, id DESC)")
-            .execute(&pool).await.map_err(storage_error)?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_memories_session_created
-             ON memories(session_id, created_at DESC)",
-        )
-        .execute(&pool)
-        .await
-        .map_err(storage_error)?;
-
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at)")
-            .execute(&pool)
-            .await
-            .map_err(storage_error)?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_memories_session_last_accessed_id
-             ON memories(session_id, last_accessed DESC, id DESC)",
-        )
-        .execute(&pool)
-        .await
-        .map_err(storage_error)?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_memories_last_accessed_id
-             ON memories(last_accessed DESC, id DESC)",
-        )
-        .execute(&pool)
-        .await
-        .map_err(storage_error)?;
+        initialize_schema(&pool).await?;
 
         Ok(Self { pool })
     }
