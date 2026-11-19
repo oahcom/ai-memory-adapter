@@ -582,16 +582,69 @@ fn tokenize(text: &str) -> HashSet<String> {
     tokens
 }
 
+/// Classification used only by [`lexical_score`] when deciding whether a token
+/// carries enough matching span to count as evidence.
+///
+/// Deliberately separate from [`is_cjk`], which drives `tokenize()` n-gram
+/// expansion. That function is a tokenizer contract and is intentionally left
+/// unchanged here: widening it would alter how supplementary-plane runs are
+/// expanded into unigrams and bigrams. Keeping the two classifications apart is
+/// a recorded trade-off, not an oversight.
+fn is_cjk_unigram_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0x20000..=0x2A6DF
+            | 0x2A700..=0x2B73F
+            | 0x2B740..=0x2B81F
+            | 0x2B820..=0x2CEAF
+            | 0x2CEB0..=0x2EE5F
+            | 0x2F800..=0x2FA1F
+            | 0x30000..=0x3134F
+            | 0x31350..=0x323AF
+    )
+}
+
+/// Scores the fraction of effective query tokens found in the content.
+///
+/// Single-character CJK tokens are excluded because they are unigrams,
+/// not sufficient evidence of lexical relevance. Multi-character tokens
+/// and non-CJK tokens, including single-character English words, remain
+/// eligible to contribute to the score.
 fn lexical_score(query_tokens: &HashSet<String>, content: &str) -> f32 {
     if query_tokens.is_empty() {
         return 0.0;
     }
-    let content_tokens = tokenize(content);
-    let matched = query_tokens
+
+    // Single-character CJK tokens are unigrams, not sufficient evidence
+    // of lexical relevance. Keep multi-character tokens and all non-CJK
+    // tokens, including single-character English words.
+    let effective_tokens: Vec<&String> = query_tokens
         .iter()
+        .filter(|token| {
+            let mut chars = token.chars();
+            !matches!(
+                (chars.next(), chars.next()),
+                (Some(ch), None) if is_cjk_unigram_char(ch)
+            )
+        })
+        .collect();
+
+    // A query containing only single-character CJK unigrams has no
+    // effective matching span.
+    if effective_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let content_tokens = tokenize(content);
+    let matched = effective_tokens
+        .iter()
+        .copied()
         .filter(|t| content_tokens.contains(*t))
         .count();
-    matched as f32 / query_tokens.len() as f32
+    matched as f32 / effective_tokens.len() as f32
 }
 
 #[cfg(test)]
@@ -845,5 +898,82 @@ mod tests {
             report.entries_deleted + report.entries_retained,
             "examined == deleted + retained when no concurrent skips"
         );
+    }
+    #[test]
+    fn lexical_score_rejects_single_character_cjk_queries() {
+        let query_tokens = tokenize("天");
+
+        for content in &["今天天气很好", "天气晴朗", "无关内容"] {
+            let score = lexical_score(&query_tokens, content);
+            assert_eq!(score, 0.0, "content: {content}");
+
+            for threshold in [0.10_f32, 0.20, 0.25] {
+                assert!(
+                    score < threshold,
+                    "single-character CJK query must be rejected at threshold {threshold}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lexical_score_preserves_multi_character_cjk_matches() {
+        let cases = [("天气", "今天天气很好"), ("机器学", "机器学习是人工智能")];
+
+        for (query, content) in cases {
+            let score = lexical_score(&tokenize(query), content);
+            assert!(
+                score > 0.34,
+                "expected effective CJK matching span: {query} -> {content}, score={score}"
+            );
+        }
+    }
+
+    #[test]
+    fn lexical_score_preserves_english_and_mixed_queries() {
+        // A one-character English token remains valid.
+        assert_eq!(lexical_score(&tokenize("a"), "a useful example"), 1.0);
+
+        // English and multi-character CJK tokens both contribute.
+        assert!(lexical_score(&tokenize("Rust 天气"), "Rust 天气很好") > 0.34);
+    }
+
+    #[test]
+    fn lexical_score_documents_repeated_cjk_bigram_boundary() {
+        // "天天" produces { "天", "天天" }.
+        // The unigram is excluded, but the bigram remains valid.
+        // This behavior is explicitly outside the single-character fix.
+        let score = lexical_score(&tokenize("天天"), "今天天气很好");
+        assert_eq!(score, 1.0);
+    }
+    #[test]
+    fn lexical_score_rejects_supplementary_plane_cjk_unigrams() {
+        // Extension B and Extension G, so a fix that only widens one plane fails.
+        let cases = [
+            ("\u{20000}", "\u{20000}"),         // Ext B
+            ("\u{30000}", "\u{30000}"),         // Ext G
+            ("\u{2A700}", "\u{2A700}\u{4E00}"), // Ext C vs mixed content
+        ];
+
+        for (query, content) in cases {
+            let score = lexical_score(&tokenize(query), content);
+            assert_eq!(
+                score, 0.0,
+                "supplementary-plane CJK unigram must not match: {query:?} -> {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lexical_score_keeps_ascii_single_character_tokens() {
+        // Widening the CJK range must not sweep in ASCII.
+        assert_eq!(lexical_score(&tokenize("a"), "a useful example"), 1.0);
+        assert_eq!(lexical_score(&tokenize("1"), "item 1 of 3"), 1.0);
+    }
+
+    #[test]
+    fn lexical_score_keeps_multi_character_cjk_after_range_widening() {
+        assert!(lexical_score(&tokenize("天气"), "今天天气很好") > 0.34);
+        assert!(lexical_score(&tokenize("机器学"), "机器学习是人工智能") > 0.34);
     }
 }
