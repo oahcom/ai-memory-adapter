@@ -1,5 +1,5 @@
 use ai_memory_adapter::{
-    adapter::{AdapterError, MemoryAdapter, MemoryEntry},
+    adapter::{AdapterError, AdapterResult, MemoryAdapter, MemoryEntry, Query},
     context::{ContextConfig, ContextInjector},
     storage::SqliteStorage,
 };
@@ -215,3 +215,38 @@ async fn inject_work_item_retrieves_across_sessions_but_excludes_other_items() {
     drop(storage);
     let _ = std::fs::remove_file(path);
 }
+
+struct OutOfScopeAdapter {
+    entry: MemoryEntry,
+}
+
+#[async_trait::async_trait]
+impl MemoryAdapter for OutOfScopeAdapter {
+    async fn store(&self, _entry: MemoryEntry) -> AdapterResult<Uuid> {
+        unreachable!("store is not used by this test")
+    }
+
+    async fn query(&self, _query: &Query) -> AdapterResult<Vec<MemoryEntry>> {
+        Ok(vec![self.entry.clone()])
+    }
+
+    async fn inject_context(&self, _session_id: &str) -> AdapterResult<String> {
+        unreachable!("inject_context is not used by this test")
+    }
+
+    async fn prune(&self, _before: chrono::DateTime<Utc>) -> AdapterResult<usize> {
+        unreachable!("prune is not used by this test")
+    }
+}
+
+#[tokio::test]
+async fn inject_work_item_fails_closed_if_adapter_returns_another_work_item() {
+    let mut foreign = memory("session-b", "Rust private content from another work item");
+    foreign.work_item_id = Some("WI-B".into());
+    let adapter = OutOfScopeAdapter { entry: foreign };
+    let injector = ContextInjector::new(&adapter, test_config(10, 8_000)).unwrap();
+
+    let result = injector.inject_work_item("WI-A", "Rust").await;
+    assert!(matches!(result, Err(AdapterError::Storage(_))));
+}
+
