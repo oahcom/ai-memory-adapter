@@ -278,7 +278,8 @@ async fn inject_work_item_escapes_newlines_that_could_forge_provenance() {
 
     drop(storage);
     let _ = std::fs::remove_file(path);
-}\n
+}
+
 #[tokio::test]
 async fn inject_work_item_encodes_structural_metadata_delimiters() {
     let (storage, path) = setup().await;
