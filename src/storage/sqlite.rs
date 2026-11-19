@@ -47,6 +47,7 @@ impl SqliteStorage {
             "CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY NOT NULL,
                 session_id TEXT NOT NULL,
+                work_item_id TEXT,
                 content TEXT NOT NULL,
                 embedding_json TEXT,
                 metadata_json TEXT NOT NULL,
@@ -58,6 +59,16 @@ impl SqliteStorage {
         .execute(&pool)
         .await
         .map_err(storage_error)?;
+
+        let columns = sqlx::query("PRAGMA table_info(memories)")
+            .fetch_all(&pool).await.map_err(storage_error)?;
+        let has_work_item_id = columns.iter().any(|row| row.get::<String, _>("name") == "work_item_id");
+        if !has_work_item_id {
+            sqlx::query("ALTER TABLE memories ADD COLUMN work_item_id TEXT")
+                .execute(&pool).await.map_err(storage_error)?;
+        }
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_memories_work_item_last_accessed_id ON memories(work_item_id, last_accessed DESC, id DESC)")
+            .execute(&pool).await.map_err(storage_error)?;
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_memories_session_created
@@ -166,7 +177,7 @@ impl SqliteStorage {
         loop {
             // Fetch one batch using keyset pagination.
             let rows = sqlx::query(
-                "SELECT id, session_id, content, embedding_json, metadata_json,
+                "SELECT id, session_id, work_item_id, content, embedding_json, metadata_json,
                         created_at, access_count, last_accessed
                  FROM memories
                  WHERE id > ? AND id <= ?
@@ -270,11 +281,12 @@ impl MemoryAdapter for SqliteStorage {
         let metadata_json = serde_json::to_string(&entry.metadata)?;
 
         sqlx::query(
-            "INSERT INTO memories (id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO memories (id, session_id, work_item_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(entry.id.to_string())
         .bind(&entry.session_id)
+        .bind(&entry.work_item_id)
         .bind(&entry.content)
         .bind(embedding_json)
         .bind(metadata_json)
@@ -301,19 +313,15 @@ impl MemoryAdapter for SqliteStorage {
 
         let mut tx = self.pool.begin().await.map_err(storage_error)?;
 
-        let rows = if let Some(session_id) = &query.session_id {
-            sqlx::query("SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories WHERE session_id = ? ORDER BY last_accessed DESC, id DESC LIMIT ?")
-                .bind(session_id)
-                .bind(candidate_limit as i64)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(storage_error)?
-        } else {
-            sqlx::query("SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories ORDER BY last_accessed DESC, id DESC LIMIT ?")
-                .bind(candidate_limit as i64)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(storage_error)?
+        let rows = match (&query.work_item_id, &query.session_id) {
+            (Some(w), Some(s)) => sqlx::query("SELECT id, session_id, work_item_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories WHERE work_item_id = ? AND session_id = ? ORDER BY last_accessed DESC, id DESC LIMIT ?")
+                .bind(w).bind(s).bind(candidate_limit as i64).fetch_all(&mut *tx).await.map_err(storage_error)?,
+            (Some(w), None) => sqlx::query("SELECT id, session_id, work_item_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories WHERE work_item_id = ? ORDER BY last_accessed DESC, id DESC LIMIT ?")
+                .bind(w).bind(candidate_limit as i64).fetch_all(&mut *tx).await.map_err(storage_error)?,
+            (None, Some(s)) => sqlx::query("SELECT id, session_id, work_item_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories WHERE session_id = ? ORDER BY last_accessed DESC, id DESC LIMIT ?")
+                .bind(s).bind(candidate_limit as i64).fetch_all(&mut *tx).await.map_err(storage_error)?,
+            (None, None) => sqlx::query("SELECT id, session_id, work_item_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories ORDER BY last_accessed DESC, id DESC LIMIT ?")
+                .bind(candidate_limit as i64).fetch_all(&mut *tx).await.map_err(storage_error)?,
         };
 
         #[cfg(test)]
@@ -369,7 +377,7 @@ impl MemoryAdapter for SqliteStorage {
 
         let mut tx = self.pool.begin().await.map_err(storage_error)?;
 
-        let rows = sqlx::query("SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories WHERE session_id = ? ORDER BY last_accessed DESC, created_at DESC LIMIT 10")
+        let rows = sqlx::query("SELECT id, session_id, work_item_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories WHERE session_id = ? ORDER BY last_accessed DESC, created_at DESC LIMIT 10")
             .bind(session_id)
             .fetch_all(&mut *tx)
             .await
@@ -460,6 +468,7 @@ fn decode_entry(row: &sqlx::sqlite::SqliteRow) -> AdapterResult<MemoryEntry> {
     Ok(MemoryEntry {
         id,
         session_id: row.try_get("session_id").map_err(storage_error)?,
+        work_item_id: row.try_get("work_item_id").map_err(storage_error)?,
         content: row.try_get("content").map_err(storage_error)?,
         embedding,
         metadata,
@@ -505,6 +514,7 @@ mod tests {
         MemoryEntry {
             id: uuid::Uuid::new_v4(),
             session_id: session.into(),
+            work_item_id: None,
             content: content.into(),
             embedding: Some(vec![0.1, 0.2, 0.3]),
             metadata: serde_json::json!({"source": "unit-test"}),
@@ -686,6 +696,7 @@ mod tests {
         let q = Query {
             text: "special keyword".into(),
             session_id: Some(session.into()),
+            work_item_id: None,
             limit: 200,
             threshold: 0.0,
         };
@@ -722,6 +733,7 @@ mod tests {
             let q = Query {
                 text: format!("acc {}", i),
                 session_id: Some(session.into()),
+                work_item_id: None,
                 limit: 1,
                 threshold: 0.0,
             };
