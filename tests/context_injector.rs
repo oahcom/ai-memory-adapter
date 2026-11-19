@@ -383,4 +383,3 @@ async fn inject_escapes_control_and_record_delimiter_characters() {
     drop(storage);
     let _ = std::fs::remove_file(path);
 }
-
