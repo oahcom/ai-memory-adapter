@@ -148,7 +148,14 @@ impl<'a> ContextInjector<'a> {
         let mut entries_omitted = 0;
         let mut chars_used = 0;
         for memory in memories {
-            let line = format!("[{}] {}", memory.created_at.to_rfc3339(), memory.content);
+            let line = format!(
+                "[memory_id={} work_item_id={} session_id={} created_at={}] {}",
+                memory.id,
+                work_item_id,
+                memory.session_id,
+                memory.created_at.to_rfc3339(),
+                memory.content
+            );
             let separator_chars = if text.is_empty() { 0 } else { 1 };
             let required_chars = line.chars().count().saturating_add(separator_chars);
             if required_chars > self.config.max_chars.saturating_sub(chars_used) {
