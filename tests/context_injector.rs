@@ -249,4 +249,3 @@ async fn inject_work_item_fails_closed_if_adapter_returns_another_work_item() {
     let result = injector.inject_work_item("WI-A", "Rust").await;
     assert!(matches!(result, Err(AdapterError::Storage(_))));
 }
-
