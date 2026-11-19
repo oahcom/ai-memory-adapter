@@ -469,11 +469,67 @@ fn decode_entry(row: &sqlx::sqlite::SqliteRow) -> AdapterResult<MemoryEntry> {
     })
 }
 
+/// Returns whether a character belongs to one of the supported CJK
+/// Unified Ideographs or Compatibility Ideographs Unicode blocks.
+fn is_cjk(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+    )
+}
+
+/// Tokenizes text while preserving the original alphanumeric segments.
+///
+/// Every segment is emitted as a complete lowercase token, preserving
+/// the previous behavior for English-only text.
+///
+/// Additionally, each contiguous CJK run emits:
+/// - Character unigrams, allowing single-character partial matches.
+/// - Character bigrams, allowing multi-character partial matches.
+///
+/// Punctuation separates segments and CJK runs. No external dependencies
+/// are required.
 fn tokenize(text: &str) -> HashSet<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(str::to_lowercase)
-        .collect()
+    let mut tokens = HashSet::new();
+
+    for segment in text.split(|c: char| !c.is_alphanumeric()) {
+        if segment.is_empty() {
+            continue;
+        }
+
+        // Preserve the complete segment token.
+        tokens.insert(segment.to_lowercase());
+
+        let chars: Vec<char> = segment.chars().collect();
+        let mut index = 0;
+
+        while index < chars.len() {
+            if !is_cjk(chars[index]) {
+                index += 1;
+                continue;
+            }
+
+            // Find the end of this contiguous CJK run.
+            let start = index;
+            while index < chars.len() && is_cjk(chars[index]) {
+                index += 1;
+            }
+
+            let run = &chars[start..index];
+
+            // Emit character unigrams.
+            for ch in run {
+                tokens.insert(ch.to_string());
+            }
+
+            // Emit character bigrams.
+            for pair in run.windows(2) {
+                tokens.insert(pair.iter().collect());
+            }
+        }
+    }
+
+    tokens
 }
 
 fn lexical_score(query_tokens: &HashSet<String>, content: &str) -> f32 {
