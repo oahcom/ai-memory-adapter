@@ -21,6 +21,7 @@ fn memory(
     MemoryEntry {
         id: Uuid::new_v4(),
         session_id: "pruning-test".into(),
+        work_item_id: None,
         content: content.into(),
         embedding: None,
         metadata: json!({"source": "ebbinghaus-test"}),
