@@ -57,6 +57,13 @@ pub struct ContextResult {
     pub chars_used: usize,
 }
 
+// Escape untrusted values before embedding them in the line-oriented context format.
+// This preserves ordinary printable text while preventing embedded control characters
+// (especially CR/LF) from creating forged physical provenance records.
+fn escape_context_value(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
+}
+
 /// Builds a bounded context from an existing memory adapter.
 pub struct ContextInjector<'a> {
     adapter: &'a dyn MemoryAdapter,
@@ -156,26 +163,16 @@ impl<'a> ContextInjector<'a> {
                     memory.id, work_item_id
                 )));
             }
-            // Encode every untrusted string field as a JSON string. This keeps
-            // embedded newlines/control characters from creating forged physical
-            // provenance records in the line-oriented context representation.
-            let encoded_work_item_id = serde_json::to_string(work_item_id).map_err(|error| {
-                AdapterError::Storage(format!("failed to encode Work Item ID: {error}"))
-            })?;
-            let encoded_session_id =
-                serde_json::to_string(&memory.session_id).map_err(|error| {
-                    AdapterError::Storage(format!("failed to encode session ID: {error}"))
-                })?;
-            let encoded_content = serde_json::to_string(&memory.content).map_err(|error| {
-                AdapterError::Storage(format!("failed to encode memory content: {error}"))
-            })?;
+            let escaped_work_item_id = escape_context_value(work_item_id);
+            let escaped_session_id = escape_context_value(&memory.session_id);
+            let escaped_content = escape_context_value(&memory.content);
             let line = format!(
                 "[memory_id={} work_item_id={} session_id={} created_at={}] {}",
                 memory.id,
-                encoded_work_item_id,
-                encoded_session_id,
+                escaped_work_item_id,
+                escaped_session_id,
                 memory.created_at.to_rfc3339(),
-                encoded_content
+                escaped_content
             );
             let separator_chars = if text.is_empty() { 0 } else { 1 };
             let required_chars = line.chars().count().saturating_add(separator_chars);
