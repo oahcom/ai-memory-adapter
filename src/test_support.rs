@@ -6,6 +6,49 @@ use std::sync::{Arc, Mutex};
 type PruneHook = Arc<dyn Fn(usize) -> Result<(), String> + Send + Sync>;
 
 static PRUNE_TEST_HOOK: Mutex<Option<PruneHook>> = Mutex::new(None);
+type PruneDeleteHook = Arc<dyn Fn(usize) -> Result<(), String> + Send + Sync>;
+static PRUNE_DELETE_TEST_HOOK: Mutex<Option<PruneDeleteHook>> = Mutex::new(None);
+
+/// Get the current hook called after each successful DELETE in prune_ebbinghaus.
+pub(crate) fn prune_delete_hook() -> Option<PruneDeleteHook> {
+    PRUNE_DELETE_TEST_HOOK.lock().unwrap().clone()
+}
+
+/// Set the in-transaction DELETE hook. Returns a guard that clears it on drop.
+pub(crate) fn set_prune_delete_hook(hook: PruneDeleteHook) -> PruneDeleteHookGuard {
+    *PRUNE_DELETE_TEST_HOOK.lock().unwrap() = Some(hook);
+    PruneDeleteHookGuard
+}
+
+pub(crate) struct PruneDeleteHookGuard;
+
+impl Drop for PruneDeleteHookGuard {
+    fn drop(&mut self) {
+        *PRUNE_DELETE_TEST_HOOK.lock().unwrap() = None;
+    }
+}
+
+type SchemaMigrationHook = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+static SCHEMA_MIGRATION_TEST_HOOK: Mutex<Option<SchemaMigrationHook>> = Mutex::new(None);
+
+/// Get the current schema migration hook.
+pub(crate) fn schema_migration_hook() -> Option<SchemaMigrationHook> {
+    SCHEMA_MIGRATION_TEST_HOOK.lock().unwrap().clone()
+}
+
+/// Set the schema migration hook. Returns a guard that clears it on drop.
+pub(crate) fn set_schema_migration_hook(hook: SchemaMigrationHook) -> SchemaMigrationHookGuard {
+    *SCHEMA_MIGRATION_TEST_HOOK.lock().unwrap() = Some(hook);
+    SchemaMigrationHookGuard
+}
+
+pub(crate) struct SchemaMigrationHookGuard;
+
+impl Drop for SchemaMigrationHookGuard {
+    fn drop(&mut self) {
+        *SCHEMA_MIGRATION_TEST_HOOK.lock().unwrap() = None;
+    }
+}
 
 /// Get the current prune hook, if set.
 pub(crate) fn prune_hook() -> Option<PruneHook> {
