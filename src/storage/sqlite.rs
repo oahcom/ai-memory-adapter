@@ -128,8 +128,11 @@ impl SqliteStorage {
     ) -> AdapterResult<PruneReport> {
         policy.validate()?;
 
-        // Read the max ID as scan upper bound so records inserted during pruning
-        // are not included (prevents unbounded scan growth).
+        // Read the max ID as scan upper bound to provide a finite scan boundary.
+        // Note: UUID identifiers are not monotonic, so a record inserted during
+        // pruning with an ID between the cursor and upper bound may still be
+        // included. The upper bound prevents unbounded scan growth but does not
+        // guarantee a consistent snapshot of the original record set.
         let upper_bound: Option<String> = sqlx::query("SELECT MAX(id) FROM memories")
             .fetch_one(&self.pool)
             .await
