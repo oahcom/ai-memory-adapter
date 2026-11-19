@@ -1,5 +1,6 @@
 // tests/chinese_retrieval.rs
-// P1-02: Chinese retrieval compatibility tests (produced by execution AI 6aff30bd)
+// P1-02: Chinese retrieval compatibility tests
+// Produced by ChatGPT execution AI (session 6aff37ee), coordinator applied verbatim.
 
 use ai_memory_adapter::{
     adapter::{MemoryAdapter, MemoryEntry, Query},
@@ -38,13 +39,17 @@ async fn setup(name: &str) -> (SqliteStorage, PathBuf) {
     (storage, path)
 }
 
+// Threshold 0.34: "天气" produces 3 tokens {天气, 天, 气}.
+// A single-character overlap scores 1/3 ~= 0.3333 and is rejected.
+// Genuine phrase matches score above this threshold; therefore 0.34
+// rejects incidental unigram matches while preserving partial CJK retrieval.
 async fn search(storage: &SqliteStorage, text: &str) -> Vec<MemoryEntry> {
     storage
         .query(&Query {
             text: text.into(),
             session_id: None,
             limit: 20,
-            threshold: 0.01,
+            threshold: 0.34,
         })
         .await
         .unwrap()
@@ -120,6 +125,64 @@ async fn chinese_english_mixed() {
             .iter()
             .any(|e| e.content == "Rust 的所有权系统保证内存安全"),
         "mixed Chinese and English queries must match"
+    );
+
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn chinese_single_unigram_overlap_is_rejected() {
+    let (storage, path) = setup("negative-cjk").await;
+
+    // Both distractors share only the character 天 with query 天气.
+    storage
+        .store(entry("session-zh", "明天要下雨"))
+        .await
+        .unwrap();
+
+    storage
+        .store(entry("session-zh", "今天开会"))
+        .await
+        .unwrap();
+
+    let results = search(&storage, "天气").await;
+
+    assert!(
+        results.is_empty(),
+        "single-unigram overlap must not qualify as a phrase match"
+    );
+
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn mixed_query_requires_chinese_concept_overlap() {
+    let (storage, path) = setup("negative-mixed").await;
+
+    // These records contain Rust but have no 所有权-related content.
+    storage
+        .store(entry(
+            "session-mixed",
+            "Rust is a fast programming language",
+        ))
+        .await
+        .unwrap();
+
+    storage
+        .store(entry(
+            "session-mixed",
+            "Rust provides excellent performance",
+        ))
+        .await
+        .unwrap();
+
+    let results = search(&storage, "Rust 所有权").await;
+
+    assert!(
+        results.is_empty(),
+        "matching Rust alone must not satisfy a mixed-language query requiring 所有权"
     );
 
     drop(storage);
