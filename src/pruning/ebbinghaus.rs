@@ -105,6 +105,7 @@ mod tests {
         MemoryEntry {
             id: Uuid::new_v4(),
             session_id: "test-session".into(),
+            work_item_id: None,
             content: "test memory".into(),
             embedding: None,
             metadata: json!({}),
