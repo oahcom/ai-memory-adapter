@@ -20,7 +20,7 @@
 use std::{
     collections::HashSet,
     env,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use ai_memory_adapter::{
