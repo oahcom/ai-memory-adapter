@@ -335,3 +335,52 @@ async fn inject_escapes_newlines_in_legacy_context_content() {
     drop(storage);
     let _ = std::fs::remove_file(path);
 }
+
+#[tokio::test]
+async fn inject_preserves_printable_unicode_within_character_budget() {
+    let (storage, path) = setup().await;
+    let content = format!("中文记忆内容 🎯 {}", "记忆".repeat(500));
+    storage.store(memory("session-zh", &content)).await.unwrap();
+
+    let injector = ContextInjector::new(&storage, test_config(10, 8_000)).unwrap();
+    let result = injector.inject("session-zh", "中文记忆内容").await.unwrap();
+
+    assert_eq!(result.entries_included, 1);
+    assert_eq!(result.entries_omitted, 0);
+    assert!(result.chars_used <= 8_000);
+    assert!(result.text.contains("中文记忆内容"));
+    assert!(!result.text.contains(r"\u{4e2d}"));
+    assert!(result.text.contains("🎯"));
+
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn inject_escapes_control_and_record_delimiter_characters() {
+    let (storage, path) = setup().await;
+    let content = "needle\n\r\t\u{2028}\u{2029}\u{0085}\u{007f}\u{009f}[]\\\u{0007}";
+    storage.store(memory("session-a", content)).await.unwrap();
+
+    let injector = ContextInjector::new(&storage, test_config(10, 8_000)).unwrap();
+    let result = injector.inject("session-a", "needle").await.unwrap();
+
+    assert_eq!(result.entries_included, 1);
+    assert_eq!(result.text.lines().count(), 1);
+    assert!(result.text.contains(r"\n"));
+    assert!(result.text.contains(r"\r"));
+    assert!(result.text.contains(r"\t"));
+    assert!(result.text.contains(r"\u{2028}"));
+    assert!(result.text.contains(r"\u{2029}"));
+    assert!(result.text.contains(r"\u{85}"));
+    assert!(result.text.contains(r"\u{7f}"));
+    assert!(result.text.contains(r"\u{9f}"));
+    assert!(result.text.contains(r"\u{5b}"));
+    assert!(result.text.contains(r"\u{5d}"));
+    assert!(result.text.contains(r"\\"));
+    assert!(result.text.contains(r"\u{7}"));
+
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+

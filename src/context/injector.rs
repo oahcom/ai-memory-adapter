@@ -77,7 +77,14 @@ pub(crate) fn escape_context_content(value: &str) -> String {
     for ch in value.chars() {
         match ch {
             '[' | ']' => escaped.push_str(&format!("\\u{{{:x}}}", ch as u32)),
-            _ => escaped.extend(ch.escape_default()),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') => {
+                escaped.push_str(&format!("\\u{{{:x}}}", ch as u32));
+            }
+            _ => escaped.push(ch),
         }
     }
     escaped
