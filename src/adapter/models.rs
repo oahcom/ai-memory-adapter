@@ -189,6 +189,7 @@ mod tests {
         let query = Query {
             text: "Rust".into(),
             session_id: None,
+            work_item_id: None,
             limit: 10,
             threshold: f32::NAN,
         };
