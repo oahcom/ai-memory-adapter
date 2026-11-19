@@ -1,5 +1,6 @@
 use ai_memory_adapter::{
     adapter::{AdapterError, MemoryAdapter, MemoryEntry, Query},
+    pruning::EbbinghausPolicy,
     storage::SqliteStorage,
 };
 use chrono::{Duration as ChronoDuration, Utc};
@@ -357,3 +358,321 @@ async fn inject_context_preserves_future_created_at_invariant() {
     drop(storage);
     let _ = std::fs::remove_file(path);
 }
+
+// === P0-1 Regression Tests: Bounded Query Candidates ===
+
+#[tokio::test]
+async fn query_candidate_limit_is_respected() {
+    let (storage, _path) = open_db("p0-test").await;
+    let session = "candidate-limit-test";
+
+    // Insert 50 entries (well under MAX_QUERY_CANDIDATES but enough to verify LIMIT works)
+    for i in 0..50 {
+        let entry = entry(session, &format!("memory number {} about rust", i));
+        storage.store(entry).await.unwrap();
+    }
+
+    // Query with limit=5 — should only get 5 results despite 50 candidates
+    let q = Query {
+        text: "rust".into(),
+        session_id: Some(session.into()),
+        limit: 5,
+        threshold: 0.0,
+    };
+    let results = storage.query(&q).await.unwrap();
+    assert!(
+        results.len() <= 5,
+        "results must not exceed limit: got {}",
+        results.len()
+    );
+}
+
+#[tokio::test]
+async fn query_deterministic_ordering() {
+    let (storage, _path) = open_db("p0-test").await;
+    let session = "deterministic-test";
+
+    // Insert entries with same content but different creation times
+    for i in 0..10 {
+        let mut entry = entry(session, "deterministic content");
+        entry.created_at = chrono::Utc::now() - chrono::Duration::seconds(100 - i);
+        entry.last_accessed = entry.created_at;
+        storage.store(entry).await.unwrap();
+    }
+
+    let q = Query {
+        text: "deterministic".into(),
+        session_id: Some(session.into()),
+        limit: 5,
+        threshold: 0.0,
+    };
+
+    // Query twice — results must be identical
+    let r1 = storage.query(&q).await.unwrap();
+    let r2 = storage.query(&q).await.unwrap();
+
+    assert_eq!(r1.len(), r2.len(), "same query should return same count");
+    for (a, b) in r1.iter().zip(r2.iter()) {
+        assert_eq!(a.id, b.id, "deterministic ordering: same IDs in same order");
+    }
+}
+
+#[tokio::test]
+async fn query_with_many_entries_stays_bounded() {
+    let (storage, _path) = open_db("p0-test").await;
+    let session = "bounded-test";
+
+    // Insert 200 entries
+    for i in 0..200 {
+        let entry = entry(session, &format!("entry {} with searchable keyword", i));
+        storage.store(entry).await.unwrap();
+    }
+
+    let q = Query {
+        text: "searchable".into(),
+        session_id: Some(session.into()),
+        limit: 10,
+        threshold: 0.0,
+    };
+    let results = storage.query(&q).await.unwrap();
+    assert!(
+        results.len() <= 10,
+        "must respect limit even with 200 entries: got {}",
+        results.len()
+    );
+}
+
+#[tokio::test]
+async fn query_session_isolation_with_candidates() {
+    let (storage, _path) = open_db("p0-test").await;
+
+    // Session A: 20 entries
+    for i in 0..20 {
+        let entry = entry("session-a", &format!("alpha entry {}", i));
+        storage.store(entry).await.unwrap();
+    }
+    // Session B: 20 entries
+    for i in 0..20 {
+        let entry = entry("session-b", &format!("beta entry {}", i));
+        storage.store(entry).await.unwrap();
+    }
+
+    let q = Query {
+        text: "entry".into(),
+        session_id: Some("session-a".into()),
+        limit: 50,
+        threshold: 0.0,
+    };
+    let results = storage.query(&q).await.unwrap();
+    for r in &results {
+        assert_eq!(r.session_id, "session-a", "session isolation must hold");
+    }
+}
+
+// === P0-2 Regression Tests: Batch Ebbinghaus Pruning ===
+
+#[tokio::test]
+async fn prune_ebbinghaus_empty_table() {
+    let (storage, _path) = open_db("p0-test").await;
+    let policy = EbbinghausPolicy::default();
+    let report = storage
+        .prune_ebbinghaus(&policy, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(report.entries_examined, 0);
+    assert_eq!(report.entries_deleted, 0);
+    assert_eq!(report.entries_retained, 0);
+}
+
+#[tokio::test]
+async fn prune_ebbinghaus_single_batch() {
+    let (storage, _path) = open_db("p0-test").await;
+    let session = "single-batch";
+
+    // Insert 10 entries with old timestamps (all should be pruned)
+    for i in 0..10 {
+        let mut entry = entry(session, &format!("old memory {}", i));
+        let old = chrono::Utc::now() - chrono::Duration::days(365);
+        entry.created_at = old;
+        entry.last_accessed = old;
+        storage.store(entry).await.unwrap();
+    }
+
+    let policy = EbbinghausPolicy::default();
+    let report = storage
+        .prune_ebbinghaus(&policy, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(report.entries_examined, 10);
+    assert_eq!(report.entries_deleted, 10);
+    assert_eq!(report.entries_retained, 0);
+}
+
+#[tokio::test]
+async fn prune_ebbinghaus_multi_batch() {
+    let (storage, _path) = open_db("p0-test").await;
+    let session = "multi-batch";
+
+    // Insert 600 entries (will span 3 batches of 256)
+    let old = chrono::Utc::now() - chrono::Duration::days(365);
+    for i in 0..600 {
+        let mut entry = entry(session, &format!("batch memory {}", i));
+        entry.created_at = old;
+        entry.last_accessed = old;
+        storage.store(entry).await.unwrap();
+    }
+
+    let policy = EbbinghausPolicy::default();
+    let report = storage
+        .prune_ebbinghaus(&policy, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(report.entries_examined, 600);
+    assert_eq!(report.entries_deleted, 600);
+    assert_eq!(report.entries_retained, 0);
+}
+
+#[tokio::test]
+async fn prune_ebbinghaus_partial_batch_mixed() {
+    let (storage, _path) = open_db("p0-test").await;
+    let session = "mixed-batch";
+
+    let old = chrono::Utc::now() - chrono::Duration::days(365);
+    let now = chrono::Utc::now();
+
+    // 5 old (prune) + 5 recent (keep)
+    for i in 0..5 {
+        let mut entry = entry(session, &format!("old mixed {}", i));
+        entry.created_at = old;
+        entry.last_accessed = old;
+        storage.store(entry).await.unwrap();
+    }
+    for i in 0..5 {
+        let mut entry = entry(session, &format!("recent mixed {}", i));
+        entry.created_at = now;
+        entry.last_accessed = now;
+        storage.store(entry).await.unwrap();
+    }
+
+    let policy = EbbinghausPolicy::default();
+    let report = storage.prune_ebbinghaus(&policy, now).await.unwrap();
+    assert_eq!(report.entries_examined, 10);
+    assert_eq!(report.entries_deleted, 5);
+    assert_eq!(report.entries_retained, 5);
+}
+
+#[tokio::test]
+async fn prune_ebbinghaus_nothing_to_prune() {
+    let (storage, _path) = open_db("p0-test").await;
+    let session = "nothing-to-prune";
+
+    // All recent entries — none should be pruned
+    for i in 0..10 {
+        let entry = entry(session, &format!("recent {}", i));
+        storage.store(entry).await.unwrap();
+    }
+
+    let policy = EbbinghausPolicy::default();
+    let report = storage
+        .prune_ebbinghaus(&policy, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(report.entries_examined, 10);
+    assert_eq!(report.entries_deleted, 0);
+    assert_eq!(report.entries_retained, 10);
+}
+
+#[tokio::test]
+async fn prune_ebbinghaus_all_qualify() {
+    let (storage, _path) = open_db("p0-test").await;
+    let session = "all-qualify";
+
+    let old = chrono::Utc::now() - chrono::Duration::days(365);
+    for i in 0..20 {
+        let mut entry = entry(session, &format!("forgotten {}", i));
+        entry.created_at = old;
+        entry.last_accessed = old;
+        storage.store(entry).await.unwrap();
+    }
+
+    let policy = EbbinghausPolicy::default();
+    let report = storage
+        .prune_ebbinghaus(&policy, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(report.entries_deleted, 20);
+    assert_eq!(report.entries_retained, 0);
+}
+
+#[tokio::test]
+async fn prune_ebbinghaus_delete_count_accurate() {
+    let (storage, _path) = open_db("p0-test").await;
+    let session = "count-accurate";
+
+    let old = chrono::Utc::now() - chrono::Duration::days(365);
+    let now = chrono::Utc::now();
+
+    // 15 old + 5 recent
+    for i in 0..15 {
+        let mut entry = entry(session, &format!("old count {}", i));
+        entry.created_at = old;
+        entry.last_accessed = old;
+        storage.store(entry).await.unwrap();
+    }
+    for i in 0..5 {
+        let entry = entry(session, &format!("new count {}", i));
+        storage.store(entry).await.unwrap();
+    }
+
+    let policy = EbbinghausPolicy::default();
+    let report = storage.prune_ebbinghaus(&policy, now).await.unwrap();
+
+    // Verify by counting remaining
+    let q = Query {
+        text: "count".into(),
+        session_id: Some(session.into()),
+        limit: 100,
+        threshold: 0.0,
+    };
+    let remaining = storage.query(&q).await.unwrap();
+
+    assert_eq!(report.entries_deleted, 15);
+    assert_eq!(report.entries_retained, 5);
+    assert_eq!(
+        remaining.len(),
+        5,
+        "remaining entries must match retained count"
+    );
+}
+
+#[tokio::test]
+async fn prune_ebbinghaus_retry_after_completion() {
+    let (storage, _path) = open_db("p0-test").await;
+    let session = "retry-test";
+
+    let old = chrono::Utc::now() - chrono::Duration::days(365);
+    for i in 0..10 {
+        let mut entry = entry(session, &format!("retry {}", i));
+        entry.created_at = old;
+        entry.last_accessed = old;
+        storage.store(entry).await.unwrap();
+    }
+
+    let policy = EbbinghausPolicy::default();
+    // First prune: deletes all
+    let r1 = storage
+        .prune_ebbinghaus(&policy, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(r1.entries_deleted, 10);
+
+    // Second prune (retry): should be safe, nothing left
+    let r2 = storage
+        .prune_ebbinghaus(&policy, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(r2.entries_examined, 0);
+    assert_eq!(r2.entries_deleted, 0);
+}
+
+// === Additional P0 Evidence Tests: Concurrency, Failure Injection, Scale ===
