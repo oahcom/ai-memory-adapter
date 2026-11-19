@@ -909,6 +909,19 @@ async fn query_supports_chinese_and_mixed_language_content() {
         .await
         .unwrap();
     assert_eq!(mixed_results.len(), 1);
+
+    let single_character_results = storage
+        .query(&Query {
+            text: "会".into(),
+            session_id: None,
+            work_item_id: Some("WI-LANG".into()),
+            limit: 5,
+            threshold: 1.0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(single_character_results.len(), 1);
+
     drop(storage);
     let _ = std::fs::remove_file(path);
 }
