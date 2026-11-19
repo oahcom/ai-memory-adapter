@@ -10,6 +10,7 @@ use sqlx::{
 use uuid::Uuid;
 
 use crate::adapter::{AdapterError, AdapterResult, MemoryAdapter, MemoryEntry, Query};
+use crate::context::injector::escape_context_content;
 use crate::pruning::{EbbinghausPolicy, PruneReport};
 
 /// SQLite implementation of MemoryAdapter.
@@ -445,7 +446,13 @@ impl MemoryAdapter for SqliteStorage {
 
         let context = entries
             .iter()
-            .map(|e| format!("[{}] {}", e.created_at.to_rfc3339(), e.content))
+            .map(|e| {
+                format!(
+                    "[{}] {}",
+                    e.created_at.to_rfc3339(),
+                    escape_context_content(&e.content)
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
