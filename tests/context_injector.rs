@@ -210,8 +210,8 @@ async fn inject_work_item_retrieves_across_sessions_but_excludes_other_items() {
     assert!(result.text.contains("alpha second session"));
     assert!(!result.text.contains("beta private content"));
     assert!(result.text.contains("work_item_id=\"WI-A\""));
-    assert!(result.text.contains("session_id=\\"session-a1\\""));
-    assert!(result.text.contains("session_id=\\"session-a2\\""));
+    assert!(result.text.contains("session_id=\"session-a1\""));
+    assert!(result.text.contains("session_id=\"session-a2\""));
     drop(storage);
     let _ = std::fs::remove_file(path);
 }
