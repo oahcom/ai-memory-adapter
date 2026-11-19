@@ -44,3 +44,26 @@ cargo build --release
 cargo test
 ./target/release/memory-adapter
 ```
+
+## Work Item scoped retrieval
+
+A memory may optionally carry a stable `work_item_id` in addition to its
+session identifier. Use the Work Item scope when related work continues across
+multiple ChatGPT sessions:
+
+```rust
+let results = adapter.query(&Query {
+    text: "migration design".into(),
+    session_id: None,
+    work_item_id: Some("WI-123".into()),
+    limit: 10,
+    threshold: 0.5,
+}).await?;
+
+let context = injector.inject_work_item("WI-123", "migration design").await?;
+```
+
+When both `work_item_id` and `session_id` are supplied, both filters apply.
+Existing databases are migrated with a nullable column; legacy records remain
+unscoped and are not returned by a named Work Item query. An omitted Work Item
+scope preserves the pre-existing session/global query behavior.
