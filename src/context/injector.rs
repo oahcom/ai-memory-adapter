@@ -148,10 +148,18 @@ impl<'a> ContextInjector<'a> {
         let mut entries_omitted = 0;
         let mut chars_used = 0;
         for memory in memories {
+            // Fail closed if an adapter violates the requested scope. Do not
+            // label an out-of-scope memory with the caller's Work Item ID.
+            if memory.work_item_id.as_deref() != Some(work_item_id) {
+                return Err(AdapterError::Storage(format!(
+                    "adapter returned memory {} outside requested Work Item scope {}",
+                    memory.id, work_item_id
+                )));
+            }
             let line = format!(
                 "[memory_id={} work_item_id={} session_id={} created_at={}] {}",
                 memory.id,
-                work_item_id,
+                memory.work_item_id.as_deref().unwrap_or_default(),
                 memory.session_id,
                 memory.created_at.to_rfc3339(),
                 memory.content
