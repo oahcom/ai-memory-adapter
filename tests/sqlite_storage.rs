@@ -5,7 +5,10 @@ use ai_memory_adapter::{
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::json;
-use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, Row};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    Row,
+};
 use std::{path::PathBuf, time::Duration};
 use uuid::Uuid;
 
@@ -1031,16 +1034,26 @@ async fn concurrent_processes_migrate_legacy_database_once() {
 
     let status_a = worker_a.wait().unwrap();
     let status_b = worker_b.wait().unwrap();
-    assert!(status_a.success(), "first migration worker failed: {status_a}");
-    assert!(status_b.success(), "second migration worker failed: {status_b}");
+    assert!(
+        status_a.success(),
+        "first migration worker failed: {status_a}"
+    );
+    assert!(
+        status_b.success(),
+        "second migration worker failed: {status_b}"
+    );
 
     let storage = SqliteStorage::open(&path).await.unwrap();
-    let legacy_unscoped: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE id = 'legacy-id' AND work_item_id IS NULL")
-            .fetch_one(storage.pool())
-            .await
-            .unwrap();
-    assert_eq!(legacy_unscoped, 1, "legacy data must remain intact and unscoped");
+    let legacy_unscoped: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM memories WHERE id = 'legacy-id' AND work_item_id IS NULL",
+    )
+    .fetch_one(storage.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        legacy_unscoped, 1,
+        "legacy data must remain intact and unscoped"
+    );
 
     drop(storage);
     let _ = std::fs::remove_file(&path);
@@ -1055,11 +1068,9 @@ async fn query_intersects_work_item_and_session_scopes() {
 
     let mut target = entry("session-a", "Rust shared scope target");
     target.work_item_id = Some("WI-A".into());
-    let mut same_work_item_other_session =
-        entry("session-b", "Rust shared scope other session");
+    let mut same_work_item_other_session = entry("session-b", "Rust shared scope other session");
     same_work_item_other_session.work_item_id = Some("WI-A".into());
-    let mut same_session_other_work_item =
-        entry("session-a", "Rust shared scope other work item");
+    let mut same_session_other_work_item = entry("session-a", "Rust shared scope other work item");
     same_session_other_work_item.work_item_id = Some("WI-B".into());
 
     storage.store(target).await.unwrap();
@@ -1086,3 +1097,4 @@ async fn query_intersects_work_item_and_session_scopes() {
     let _ = std::fs::remove_file(path);
 }
 
+[executed on device: MS-QSZMHWTHUAJW (5cf15972-dd57-4115-827c-7c69eeec2bab)]
