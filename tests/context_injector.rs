@@ -271,10 +271,10 @@ async fn inject_work_item_escapes_newlines_that_could_forge_provenance() {
         "untrusted content must not create a second physical provenance line"
     );
     assert!(
-        result.text.contains("\\n[memory_id=fake"),
+        result.text.contains(r"\\n\\u{5b}memory_id=fake"),
         "the embedded newline must be represented as an escaped JSON sequence"
     );
-    assert!(result.text.starts_with("[memory_id="));
+    assert!(result.text.starts_with("[memory_id="));\n    assert!(!result.text.contains("[memory_id=fake"));
 
     drop(storage);
     let _ = std::fs::remove_file(path);
