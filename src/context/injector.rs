@@ -73,7 +73,14 @@ fn escape_context_field(value: &str) -> String {
 // Escape control characters and backslashes so content cannot create another
 // physical record or forge a literal escape sequence.
 fn escape_context_content(value: &str) -> String {
-    value.chars().flat_map(char::escape_default).collect()
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '[' | ']' => escaped.push_str(&format!("\\u{{{:x}}}", ch as u32)),
+            _ => escaped.extend(ch.escape_default()),
+        }
+    }
+    escaped
 }
 
 /// Builds a bounded context from an existing memory adapter.
