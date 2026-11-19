@@ -688,6 +688,8 @@ async fn prune_ebbinghaus_retry_after_completion() {
         .unwrap();
     assert_eq!(r2.entries_examined, 0);
     assert_eq!(r2.entries_deleted, 0);
+}
+
 #[tokio::test]
 async fn query_scopes_to_work_item_across_sessions_without_cross_item_leakage() {
     let (storage, path) = open_db("work-item-isolation").await;
@@ -785,6 +787,5 @@ async fn opening_legacy_database_adds_nullable_work_item_scope_without_losing_ro
     let _ = std::fs::remove_file(path);
 }
 
-}
 
 // === Additional P0 Evidence Tests: Concurrency, Failure Injection, Scale ===
