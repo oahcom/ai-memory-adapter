@@ -5,9 +5,9 @@ use ai_memory_adapter::{
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::json;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::{path::PathBuf, time::Duration};
 use uuid::Uuid;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 fn database_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -695,20 +695,38 @@ async fn query_scopes_to_work_item_across_sessions_without_cross_item_leakage() 
     let (storage, path) = open_db("work-item-isolation").await;
     let mut a1 = entry("session-a1", "shared retrieval topic for item alpha");
     a1.work_item_id = Some("WI-A".into());
-    let mut a2 = entry("session-a2", "shared retrieval topic for item alpha second session");
+    let mut a2 = entry(
+        "session-a2",
+        "shared retrieval topic for item alpha second session",
+    );
     a2.work_item_id = Some("WI-A".into());
     let mut b1 = entry("session-b1", "shared retrieval topic for item beta");
     b1.work_item_id = Some("WI-B".into());
     storage.store(a1).await.unwrap();
     storage.store(a2).await.unwrap();
     storage.store(b1).await.unwrap();
-    let results = storage.query(&Query {
-        text: "shared retrieval topic".into(), session_id: None,
-        work_item_id: Some("WI-A".into()), limit: 20, threshold: 1.0,
-    }).await.unwrap();
+    let results = storage
+        .query(&Query {
+            text: "shared retrieval topic".into(),
+            session_id: None,
+            work_item_id: Some("WI-A".into()),
+            limit: 20,
+            threshold: 1.0,
+        })
+        .await
+        .unwrap();
     assert_eq!(results.len(), 2);
-    assert!(results.iter().all(|e| e.work_item_id.as_deref() == Some("WI-A")));
-    assert_eq!(results.iter().map(|e| e.session_id.as_str()).collect::<std::collections::HashSet<_>>().len(), 2);
+    assert!(results
+        .iter()
+        .all(|e| e.work_item_id.as_deref() == Some("WI-A")));
+    assert_eq!(
+        results
+            .iter()
+            .map(|e| e.session_id.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        2
+    );
     drop(storage);
     let _ = std::fs::remove_file(path);
 }
@@ -763,29 +781,37 @@ async fn opening_legacy_database_adds_nullable_work_item_scope_without_losing_ro
     }
 
     let storage = SqliteStorage::open(&path).await.unwrap();
-    let legacy = storage.query(&Query {
-        text: "legacy memory remains readable".into(),
-        session_id: Some("legacy-session".into()),
-        work_item_id: None,
-        limit: 5,
-        threshold: 1.0,
-    }).await.unwrap();
+    let legacy = storage
+        .query(&Query {
+            text: "legacy memory remains readable".into(),
+            session_id: Some("legacy-session".into()),
+            work_item_id: None,
+            limit: 5,
+            threshold: 1.0,
+        })
+        .await
+        .unwrap();
     assert_eq!(legacy.len(), 1);
     assert_eq!(legacy[0].id, legacy_id);
     assert_eq!(legacy[0].work_item_id, None);
 
-    let scoped = storage.query(&Query {
-        text: "legacy memory remains readable".into(),
-        session_id: None,
-        work_item_id: Some("WI-A".into()),
-        limit: 5,
-        threshold: 1.0,
-    }).await.unwrap();
-    assert!(scoped.is_empty(), "legacy unscoped records must not enter a named Work Item");
+    let scoped = storage
+        .query(&Query {
+            text: "legacy memory remains readable".into(),
+            session_id: None,
+            work_item_id: Some("WI-A".into()),
+            limit: 5,
+            threshold: 1.0,
+        })
+        .await
+        .unwrap();
+    assert!(
+        scoped.is_empty(),
+        "legacy unscoped records must not enter a named Work Item"
+    );
 
     drop(storage);
     let _ = std::fs::remove_file(path);
 }
-
 
 // === Additional P0 Evidence Tests: Concurrency, Failure Injection, Scale ===
