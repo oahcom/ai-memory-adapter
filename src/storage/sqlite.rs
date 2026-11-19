@@ -86,6 +86,21 @@ async fn initialize_schema(pool: &SqlitePool) -> AdapterResult<()> {
             .execute(&mut *connection)
             .await
             .map_err(storage_error)?;
+        #[cfg(test)]
+        {
+            let indexes = sqlx::query("PRAGMA index_list(memories)")
+                .fetch_all(&mut *connection)
+                .await
+                .map_err(storage_error)?;
+            let first_index_exists = indexes
+                .iter()
+                .any(|row| row.get::<String, _>("name") == "idx_memories_work_item_last_accessed_id");
+            if let Some(hook) = crate::test_support::schema_migration_index_hook() {
+                hook("after_first_index_created", first_index_exists).map_err(|e| {
+                    AdapterError::Storage(format!("test schema hook injected failure: {e}"))
+                })?;
+            }
+        }
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_memories_session_created
              ON memories(session_id, created_at DESC)",
@@ -1199,4 +1214,215 @@ mod tests {
         drop(storage);
         let _ = std::fs::remove_file(path);
     }
+
+    /// Failure injection after the first migration index exists in the active DDL transaction.
+    /// The hook receives an in-transaction PRAGMA observation proving the index was created.
+    #[tokio::test]
+    #[ignore = "global hook; run with --ignored --test-threads=1"]
+    async fn initialize_schema_rolls_back_index_failure_after_first_index() {
+        let path =
+            std::env::temp_dir().join(format!("unit-test-index-rollback-{}.db", Uuid::new_v4()));
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let legacy_rows = vec![
+            (
+                Uuid::from_u128(0x2001).to_string(),
+                "index-session-a".to_string(),
+                "legacy index row alpha".to_string(),
+                3_i32,
+            ),
+            (
+                Uuid::from_u128(0x2002).to_string(),
+                "index-session-b".to_string(),
+                "legacy index row beta".to_string(),
+                7_i32,
+            ),
+        ];
+
+        let legacy_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE memories (
+                id TEXT PRIMARY KEY NOT NULL,
+                session_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                embedding_json TEXT,
+                metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                access_count INTEGER NOT NULL CHECK (access_count >= 0),
+                last_accessed TEXT NOT NULL
+            )",
+        )
+        .execute(&legacy_pool)
+        .await
+        .unwrap();
+        for (id, session, content, access_count) in &legacy_rows {
+            sqlx::query(
+                "INSERT INTO memories
+                 (id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed)
+                 VALUES (?, ?, ?, NULL, '{}', ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(session)
+            .bind(content)
+            .bind(&now)
+            .bind(access_count)
+            .bind(&now)
+            .execute(&legacy_pool)
+            .await
+            .unwrap();
+        }
+        legacy_pool.close().await;
+
+        const FAILURE: &str = "F08_SCHEMA_FAILURE_AFTER_FIRST_INDEX";
+        let _guard = crate::test_support::set_schema_migration_index_hook(Arc::new(
+            |stage, first_index_exists| {
+                assert_eq!(stage, "after_first_index_created");
+                assert!(
+                    first_index_exists,
+                    "first migration index must be visible on the same transaction connection before injection"
+                );
+                Err(FAILURE.to_string())
+            },
+        ));
+        let open_error = match SqliteStorage::open(&path).await {
+            Ok(_) => panic!("open must fail after the first migration index is created"),
+            Err(error) => error,
+        };
+        assert!(
+            open_error.to_string().contains(FAILURE),
+            "open error must preserve injected failure identifier: {open_error}"
+        );
+        drop(_guard);
+
+        let expected_indexes = [
+            "idx_memories_work_item_last_accessed_id",
+            "idx_memories_session_created",
+            "idx_memories_created",
+            "idx_memories_session_last_accessed_id",
+            "idx_memories_last_accessed_id",
+        ];
+        let inspect_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&path))
+            .await
+            .unwrap();
+        let rolled_back_indexes = sqlx::query("PRAGMA index_list(memories)")
+            .fetch_all(&inspect_pool)
+            .await
+            .unwrap();
+        for expected in expected_indexes {
+            assert!(
+                !rolled_back_indexes
+                    .iter()
+                    .any(|row| row.get::<String, _>("name") == expected),
+                "failed migration must roll back index {expected}"
+            );
+        }
+        let rolled_back_columns = sqlx::query("PRAGMA table_info(memories)")
+            .fetch_all(&inspect_pool)
+            .await
+            .unwrap();
+        assert!(
+            !rolled_back_columns
+                .iter()
+                .any(|row| row.get::<String, _>("name") == "work_item_id"),
+            "ALTER must roll back together with index creation"
+        );
+
+        let read_legacy_rows = |rows: Vec<sqlx::sqlite::SqliteRow>| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.get::<String, _>("id"),
+                        row.get::<String, _>("session_id"),
+                        row.get::<String, _>("content"),
+                        row.get::<i32, _>("access_count"),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected_legacy_rows = legacy_rows.clone();
+        let before_retry =
+            sqlx::query("SELECT id, session_id, content, access_count FROM memories ORDER BY id")
+                .fetch_all(&inspect_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            read_legacy_rows(before_retry),
+            expected_legacy_rows,
+            "legacy rows and all requested values must survive failed migration"
+        );
+        inspect_pool.close().await;
+
+        let storage = SqliteStorage::open(&path)
+            .await
+            .expect("reopening without the hook must complete migration");
+        let migrated_columns = sqlx::query("PRAGMA table_info(memories)")
+            .fetch_all(storage.pool())
+            .await
+            .unwrap();
+        assert!(
+            migrated_columns
+                .iter()
+                .any(|row| row.get::<String, _>("name") == "work_item_id"),
+            "successful retry must add work_item_id"
+        );
+        let migrated_indexes = sqlx::query("PRAGMA index_list(memories)")
+            .fetch_all(storage.pool())
+            .await
+            .unwrap();
+        for expected in expected_indexes {
+            assert!(
+                migrated_indexes
+                    .iter()
+                    .any(|row| row.get::<String, _>("name") == expected),
+                "successful retry must create index {expected}"
+            );
+        }
+        let after_retry =
+            sqlx::query("SELECT id, session_id, content, access_count FROM memories ORDER BY id")
+                .fetch_all(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            read_legacy_rows(after_retry),
+            expected_legacy_rows,
+            "legacy rows must remain intact after successful retry"
+        );
+
+        let mut new_entry = test_entry("index-session-a", "scoped index migration probe");
+        new_entry.work_item_id = Some("work-item-f08".into());
+        storage.store(new_entry.clone()).await.unwrap();
+        let scoped_results = storage
+            .query(&Query {
+                text: "scoped index migration probe".into(),
+                session_id: Some("index-session-a".into()),
+                work_item_id: Some("work-item-f08".into()),
+                limit: 5,
+                threshold: 1.0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(scoped_results.len(), 1);
+        assert_eq!(scoped_results[0].id, new_entry.id);
+        assert_eq!(
+            scoped_results[0].work_item_id.as_deref(),
+            Some("work-item-f08")
+        );
+
+        let context = storage.inject_context("index-session-a").await.unwrap();
+        assert!(context.contains("legacy index row alpha"));
+        assert!(context.contains("scoped index migration probe"));
+
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
 }
