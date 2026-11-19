@@ -291,34 +291,84 @@ impl MemoryAdapter for SqliteStorage {
     async fn query(&self, query: &Query) -> AdapterResult<Vec<MemoryEntry>> {
         query.validate()?;
 
-        // P0-1: Bound the candidate set at the SQL level to prevent unbounded
-        // full-table loading. candidate_limit = clamp(result_limit * 10, 100, MAX_QUERY_CANDIDATES).
-        // Scoring runs only on this bounded set; see API docs for recall implications.
+        // P0-1: Bound the candidate set at the SQL level.
+        // candidate_limit = clamp(result_limit * 10, 100, MAX_QUERY_CANDIDATES).
         let candidate_limit = query
             .limit
             .saturating_mul(10)
             .clamp(100, MAX_QUERY_CANDIDATES);
 
+        // Allocate 20% to older candidates; integer remainder goes to recent.
+        let older_slots = ((candidate_limit * 20) / 100).max(1);
+        let recent_slots = candidate_limit - older_slots;
+
         let mut tx = self.pool.begin().await.map_err(storage_error)?;
 
-        let rows = if let Some(session_id) = &query.session_id {
-            sqlx::query("SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories WHERE session_id = ? ORDER BY last_accessed DESC, id DESC LIMIT ?")
-                .bind(session_id)
-                .bind(candidate_limit as i64)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(storage_error)?
+        let (recent_rows, older_rows) = if let Some(session_id) = &query.session_id {
+            let recent_rows = sqlx::query(
+                "SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories WHERE session_id = ? ORDER BY last_accessed DESC, id DESC LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(recent_slots as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+
+            let older_rows = sqlx::query(
+                "SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories WHERE session_id = ? ORDER BY last_accessed ASC, id ASC LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(older_slots as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+
+            (recent_rows, older_rows)
         } else {
-            sqlx::query("SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories ORDER BY last_accessed DESC, id DESC LIMIT ?")
-                .bind(candidate_limit as i64)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(storage_error)?
+            let recent_rows = sqlx::query(
+                "SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories ORDER BY last_accessed DESC, id DESC LIMIT ?",
+            )
+            .bind(recent_slots as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+
+            let older_rows = sqlx::query(
+                "SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories ORDER BY last_accessed ASC, id ASC LIMIT ?",
+            )
+            .bind(older_slots as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+
+            (recent_rows, older_rows)
         };
+
+        // Deduplicate by TEXT id. Recent-layer rows take priority.
+        let mut seen_ids = std::collections::HashSet::<String>::new();
+        let mut rows = Vec::with_capacity(candidate_limit);
+
+        for row in recent_rows.into_iter().chain(older_rows) {
+            let id: String = row.try_get("id").map_err(storage_error)?;
+
+            if seen_ids.insert(id) {
+                rows.push(row);
+            }
+        }
 
         #[cfg(test)]
         crate::test_support::LAST_QUERY_CANDIDATE_COUNT
             .store(rows.len(), std::sync::atomic::Ordering::SeqCst);
+
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let ids: Vec<uuid::Uuid> = rows
+                .iter()
+                .filter_map(|row| row.try_get::<String, _>("id").ok())
+                .filter_map(|text| uuid::Uuid::parse_str(&text).ok())
+                .collect();
+            crate::test_support::record_query_candidate_ids(ids);
+        }
 
         let query_tokens = tokenize(&query.text);
         let mut matches: Vec<(f32, MemoryEntry)> = Vec::new();

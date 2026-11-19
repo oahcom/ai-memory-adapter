@@ -7,5 +7,9 @@ pub mod context;
 pub mod pruning;
 pub mod storage;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_support;
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support_api;

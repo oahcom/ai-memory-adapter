@@ -27,6 +27,7 @@ tokio-test = "0.4"
 default = ["qdrant"]
 faiss-backend = ["faiss"]
 qdrant = ["qdrant-client"]
+test-support = []
 
 [[bin]]
 name = "memory-adapter"
