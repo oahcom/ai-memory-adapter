@@ -814,4 +814,103 @@ async fn opening_legacy_database_adds_nullable_work_item_scope_without_losing_ro
     let _ = std::fs::remove_file(path);
 }
 
+#[tokio::test]
+async fn work_item_scope_persists_across_database_reopen() {
+    let path = database_path("work-item-reopen");
+    let mut record = entry("session-before-reopen", "persistent work item memory");
+    record.work_item_id = Some("WI-PERSIST".into());
+    let record_id = record.id;
+    {
+        let storage = SqliteStorage::open(&path).await.unwrap();
+        storage.store(record).await.unwrap();
+    }
+    {
+        let storage = SqliteStorage::open(&path).await.unwrap();
+        let results = storage
+            .query(&Query {
+                text: "persistent work item".into(),
+                session_id: None,
+                work_item_id: Some("WI-PERSIST".into()),
+                limit: 5,
+                threshold: 1.0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, record_id);
+        assert_eq!(results[0].work_item_id.as_deref(), Some("WI-PERSIST"));
+        assert_eq!(results[0].session_id, "session-before-reopen");
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn work_item_scope_is_applied_before_candidate_limit() {
+    let (storage, path) = open_db("work-item-candidate-filter").await;
+    let mut relevant = entry("session-a", "distinctive retrieval phrase");
+    relevant.work_item_id = Some("WI-A".into());
+    relevant.created_at = Utc::now() - ChronoDuration::days(2);
+    relevant.last_accessed = relevant.created_at;
+    storage.store(relevant).await.unwrap();
+
+    for index in 0..120 {
+        let mut unrelated = entry("session-b", &format!("unrelated recent record {index}"));
+        unrelated.work_item_id = Some("WI-B".into());
+        storage.store(unrelated).await.unwrap();
+    }
+
+    let results = storage
+        .query(&Query {
+            text: "distinctive retrieval phrase".into(),
+            session_id: None,
+            work_item_id: Some("WI-A".into()),
+            limit: 1,
+            threshold: 1.0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].work_item_id.as_deref(), Some("WI-A"));
+    assert!(results[0].content.contains("distinctive retrieval phrase"));
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn query_supports_chinese_and_mixed_language_content() {
+    let (storage, path) = open_db("chinese-mixed-language").await;
+    let mut chinese = entry(
+        "session-zh",
+        "跨会话检索需要 explicit work item retrieval scope",
+    );
+    chinese.work_item_id = Some("WI-LANG".into());
+    storage.store(chinese).await.unwrap();
+
+    let chinese_results = storage
+        .query(&Query {
+            text: "跨会话检索".into(),
+            session_id: None,
+            work_item_id: Some("WI-LANG".into()),
+            limit: 5,
+            threshold: 1.0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(chinese_results.len(), 1);
+
+    let mixed_results = storage
+        .query(&Query {
+            text: "跨会话 retrieval".into(),
+            session_id: None,
+            work_item_id: Some("WI-LANG".into()),
+            limit: 5,
+            threshold: 1.0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(mixed_results.len(), 1);
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+
 // === Additional P0 Evidence Tests: Concurrency, Failure Injection, Scale ===
