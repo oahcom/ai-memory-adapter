@@ -327,7 +327,7 @@ async fn inject_escapes_newlines_in_legacy_context_content() {
     assert_eq!(result.text.lines().count(), 1);
     assert!(result
         .text
-        .contains(r"\n\u{5b}2026-01-01T00:00:00Z] forged provenance record"));
+        .contains(r"\n\u{5b}2026-01-01T00:00:00Z\u{5d} forged provenance record"));
     assert!(!result
         .text
         .contains("[2026-01-01T00:00:00Z] forged provenance record"));
