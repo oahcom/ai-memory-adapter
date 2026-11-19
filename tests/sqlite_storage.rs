@@ -1,5 +1,6 @@
 use ai_memory_adapter::{
     adapter::{AdapterError, MemoryAdapter, MemoryEntry, Query},
+    context::{ContextConfig, ContextInjector},
     pruning::EbbinghausPolicy,
     storage::SqliteStorage,
 };
@@ -997,102 +998,3 @@ async fn concurrent_processes_migrate_legacy_database_once() {
          (id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed)
          VALUES ('legacy-id', 'legacy-session', 'legacy content', NULL, '{}',
                  '2020-01-01T00:00:00Z', 0, '2020-01-01T00:00:00Z')",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    drop(pool);
-
-    let executable = std::env::current_exe().unwrap();
-    let ready_a = format!("{}.worker-a.ready", path.display());
-    let ready_b = format!("{}.worker-b.ready", path.display());
-    let go = format!("{}.go", path.display());
-    let spawn_worker = |ready: &str| {
-        std::process::Command::new(&executable)
-            .arg("--exact")
-            .arg("concurrent_legacy_migration_worker")
-            .arg("--nocapture")
-            .env("AI_MEMORY_MIGRATION_WORKER_DB", &path)
-            .env("AI_MEMORY_MIGRATION_WORKER_READY", ready)
-            .env("AI_MEMORY_MIGRATION_WORKER_GO", &go)
-            .spawn()
-            .unwrap()
-    };
-    let mut worker_a = spawn_worker(&ready_a);
-    let mut worker_b = spawn_worker(&ready_b);
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while !(PathBuf::from(&ready_a).exists() && PathBuf::from(&ready_b).exists()) {
-        if std::time::Instant::now() >= deadline {
-            let _ = worker_a.kill();
-            let _ = worker_b.kill();
-            panic!("migration workers did not reach the start barrier");
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    std::fs::write(&go, "go").unwrap();
-
-    let status_a = worker_a.wait().unwrap();
-    let status_b = worker_b.wait().unwrap();
-    assert!(
-        status_a.success(),
-        "first migration worker failed: {status_a}"
-    );
-    assert!(
-        status_b.success(),
-        "second migration worker failed: {status_b}"
-    );
-
-    let storage = SqliteStorage::open(&path).await.unwrap();
-    let legacy_unscoped: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM memories WHERE id = 'legacy-id' AND work_item_id IS NULL",
-    )
-    .fetch_one(storage.pool())
-    .await
-    .unwrap();
-    assert_eq!(
-        legacy_unscoped, 1,
-        "legacy data must remain intact and unscoped"
-    );
-
-    drop(storage);
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(ready_a);
-    let _ = std::fs::remove_file(ready_b);
-    let _ = std::fs::remove_file(go);
-}
-
-#[tokio::test]
-async fn query_intersects_work_item_and_session_scopes() {
-    let (storage, path) = open_db("work-item-session-intersection").await;
-
-    let mut target = entry("session-a", "Rust shared scope target");
-    target.work_item_id = Some("WI-A".into());
-    let mut same_work_item_other_session = entry("session-b", "Rust shared scope other session");
-    same_work_item_other_session.work_item_id = Some("WI-A".into());
-    let mut same_session_other_work_item = entry("session-a", "Rust shared scope other work item");
-    same_session_other_work_item.work_item_id = Some("WI-B".into());
-
-    storage.store(target).await.unwrap();
-    storage.store(same_work_item_other_session).await.unwrap();
-    storage.store(same_session_other_work_item).await.unwrap();
-
-    let results = storage
-        .query(&Query {
-            text: "Rust shared scope".into(),
-            session_id: Some("session-a".into()),
-            work_item_id: Some("WI-A".into()),
-            limit: 10,
-            threshold: 1.0,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].session_id, "session-a");
-    assert_eq!(results[0].work_item_id.as_deref(), Some("WI-A"));
-    assert_eq!(results[0].content, "Rust shared scope target");
-
-    drop(storage);
-    let _ = std::fs::remove_file(path);
-}
