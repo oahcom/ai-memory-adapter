@@ -13,6 +13,7 @@ pub struct MemoryEntry {
     pub id: Uuid,
     pub session_id: String,
     /// Optional stable work-item scope shared by related sessions.
+    #[serde(default)]
     pub work_item_id: Option<String>,
     pub content: String,
     pub embedding: Option<Vec<f32>>,
@@ -74,6 +75,7 @@ pub struct Query {
     pub text: String,
     pub session_id: Option<String>,
     /// Restrict retrieval to one work item across any matching sessions.
+    #[serde(default)]
     pub work_item_id: Option<String>,
     pub limit: usize,
     pub threshold: f32,
@@ -221,5 +223,31 @@ mod tests {
             threshold: 0.5,
         };
         assert!(matches!(query.validate(), Err(AdapterError::Validation(_))));
+    }
+
+    #[test]
+    fn legacy_serialized_entries_and_queries_default_work_item_scope_to_none() {
+        let now = Utc::now();
+        let legacy_entry = json!({
+            "id": Uuid::new_v4(),
+            "session_id": "legacy-session",
+            "content": "legacy content",
+            "embedding": null,
+            "metadata": {},
+            "created_at": now,
+            "access_count": 0,
+            "last_accessed": now
+        });
+        let entry: MemoryEntry = serde_json::from_value(legacy_entry).unwrap();
+        assert_eq!(entry.work_item_id, None);
+
+        let legacy_query = json!({
+            "text": "legacy query",
+            "session_id": "legacy-session",
+            "limit": 5,
+            "threshold": 0.5
+        });
+        let query: Query = serde_json::from_value(legacy_query).unwrap();
+        assert_eq!(query.work_item_id, None);
     }
 }
