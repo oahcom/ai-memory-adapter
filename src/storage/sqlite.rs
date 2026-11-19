@@ -61,11 +61,17 @@ impl SqliteStorage {
         .map_err(storage_error)?;
 
         let columns = sqlx::query("PRAGMA table_info(memories)")
-            .fetch_all(&pool).await.map_err(storage_error)?;
-        let has_work_item_id = columns.iter().any(|row| row.get::<String, _>("name") == "work_item_id");
+            .fetch_all(&pool)
+            .await
+            .map_err(storage_error)?;
+        let has_work_item_id = columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == "work_item_id");
         if !has_work_item_id {
             sqlx::query("ALTER TABLE memories ADD COLUMN work_item_id TEXT")
-                .execute(&pool).await.map_err(storage_error)?;
+                .execute(&pool)
+                .await
+                .map_err(storage_error)?;
         }
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_memories_work_item_last_accessed_id ON memories(work_item_id, last_accessed DESC, id DESC)")
             .execute(&pool).await.map_err(storage_error)?;
