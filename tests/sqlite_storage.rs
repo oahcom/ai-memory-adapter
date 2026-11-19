@@ -20,6 +20,7 @@ fn entry(session_id: &str, content: &str) -> MemoryEntry {
     MemoryEntry {
         id: Uuid::new_v4(),
         session_id: session_id.into(),
+        work_item_id: None,
         content: content.into(),
         embedding: Some(vec![0.1, 0.2, 0.3]),
         metadata: json!({"source": "integration-test"}),
@@ -46,6 +47,7 @@ async fn store_and_query_round_trip() {
         .query(&Query {
             text: "Rust memory".into(),
             session_id: Some("session-a".into()),
+            work_item_id: None,
             limit: 10,
             threshold: 1.0,
         })
@@ -78,6 +80,7 @@ async fn query_isolates_sessions() {
         .query(&Query {
             text: "Rust memory".into(),
             session_id: Some("session-a".into()),
+            work_item_id: None,
             limit: 10,
             threshold: 1.0,
         })
@@ -104,6 +107,7 @@ async fn query_applies_threshold_and_limit() {
         .query(&Query {
             text: "Rust memory".into(),
             session_id: Some("s".into()),
+            work_item_id: None,
             limit: 1,
             threshold: 0.5,
         })
@@ -158,6 +162,7 @@ async fn prune_deletes_entries_before_timestamp() {
         .query(&Query {
             text: "memory record".into(),
             session_id: Some("s".into()),
+            work_item_id: None,
             limit: 10,
             threshold: 1.0,
         })
@@ -217,6 +222,7 @@ async fn database_can_be_reopened() {
             .query(&Query {
                 text: "persistent reopen".into(),
                 session_id: Some("s".into()),
+                work_item_id: None,
                 limit: 5,
                 threshold: 1.0,
             })
@@ -241,6 +247,7 @@ async fn access_count_overflow_returns_error_without_wrapping() {
         .query(&Query {
             text: "overflow guard".into(),
             session_id: Some("s".into()),
+            work_item_id: None,
             limit: 5,
             threshold: 1.0,
         })
@@ -275,6 +282,7 @@ async fn query_preserves_future_created_at_invariant() {
         .query(&Query {
             text: "future timestamp".into(),
             session_id: Some("s".into()),
+            work_item_id: None,
             limit: 5,
             threshold: 1.0,
         })
@@ -326,6 +334,7 @@ async fn inject_context_preserves_future_created_at_invariant() {
         .query(&Query {
             text: "future context".into(),
             session_id: Some("s".into()),
+            work_item_id: None,
             limit: 5,
             threshold: 1.0,
         })
@@ -376,6 +385,7 @@ async fn query_candidate_limit_is_respected() {
     let q = Query {
         text: "rust".into(),
         session_id: Some(session.into()),
+        work_item_id: None,
         limit: 5,
         threshold: 0.0,
     };
@@ -403,6 +413,7 @@ async fn query_deterministic_ordering() {
     let q = Query {
         text: "deterministic".into(),
         session_id: Some(session.into()),
+        work_item_id: None,
         limit: 5,
         threshold: 0.0,
     };
@@ -431,6 +442,7 @@ async fn query_with_many_entries_stays_bounded() {
     let q = Query {
         text: "searchable".into(),
         session_id: Some(session.into()),
+        work_item_id: None,
         limit: 10,
         threshold: 0.0,
     };
@@ -460,6 +472,7 @@ async fn query_session_isolation_with_candidates() {
     let q = Query {
         text: "entry".into(),
         session_id: Some("session-a".into()),
+        work_item_id: None,
         limit: 50,
         threshold: 0.0,
     };
@@ -631,6 +644,7 @@ async fn prune_ebbinghaus_delete_count_accurate() {
     let q = Query {
         text: "count".into(),
         session_id: Some(session.into()),
+        work_item_id: None,
         limit: 100,
         threshold: 0.0,
     };
@@ -673,6 +687,29 @@ async fn prune_ebbinghaus_retry_after_completion() {
         .unwrap();
     assert_eq!(r2.entries_examined, 0);
     assert_eq!(r2.entries_deleted, 0);
+#[tokio::test]
+async fn query_scopes_to_work_item_across_sessions_without_cross_item_leakage() {
+    let (storage, path) = open_db("work-item-isolation").await;
+    let mut a1 = entry("session-a1", "shared retrieval topic for item alpha");
+    a1.work_item_id = Some("WI-A".into());
+    let mut a2 = entry("session-a2", "shared retrieval topic for item alpha second session");
+    a2.work_item_id = Some("WI-A".into());
+    let mut b1 = entry("session-b1", "shared retrieval topic for item beta");
+    b1.work_item_id = Some("WI-B".into());
+    storage.store(a1).await.unwrap();
+    storage.store(a2).await.unwrap();
+    storage.store(b1).await.unwrap();
+    let results = storage.query(&Query {
+        text: "shared retrieval topic".into(), session_id: None,
+        work_item_id: Some("WI-A".into()), limit: 20, threshold: 1.0,
+    }).await.unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|e| e.work_item_id.as_deref() == Some("WI-A")));
+    assert_eq!(results.iter().map(|e| e.session_id.as_str()).collect::<std::collections::HashSet<_>>().len(), 2);
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+
 }
 
 // === Additional P0 Evidence Tests: Concurrency, Failure Injection, Scale ===
