@@ -25,6 +25,12 @@ pub const MAX_QUERY_CANDIDATES: usize = 1000;
 /// Each batch runs in its own short transaction to avoid long-running locks.
 pub const PRUNE_BATCH_SIZE: usize = 256;
 
+/// Test-only observer for the number of candidate rows fetched in query().
+/// Not part of the public API; for integration testing only.
+#[doc(hidden)]
+pub static LAST_QUERY_CANDIDATE_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub struct SqliteStorage {
     pool: SqlitePool,
 }
@@ -315,6 +321,8 @@ impl MemoryAdapter for SqliteStorage {
                 .await
                 .map_err(storage_error)?
         };
+
+        LAST_QUERY_CANDIDATE_COUNT.store(rows.len(), std::sync::atomic::Ordering::SeqCst);
 
         let query_tokens = tokenize(&query.text);
         let mut matches: Vec<(f32, MemoryEntry)> = Vec::new();

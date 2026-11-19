@@ -706,6 +706,14 @@ async fn query_max_candidate_limit_1000_is_enforced() {
         "must respect limit=200: got {}",
         results.len()
     );
-    // With 1500 records and candidate_limit=1000, only 1000 most recently
-    // accessed are loaded and scored. This is verified by the SQL LIMIT binding.
+
+    // Directly verify the candidate count observed at the SQL fetch boundary.
+    // This proves SQL LIMIT is bound to 1000 (not 2000, not unbounded).
+    let observed = ai_memory_adapter::storage::LAST_QUERY_CANDIDATE_COUNT
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        observed, 1000,
+        "SQL must fetch exactly 1000 candidates (MAX_QUERY_CANDIDATES), got {}",
+        observed
+    );
 }
