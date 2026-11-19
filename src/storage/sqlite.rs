@@ -187,8 +187,11 @@ impl SqliteStorage {
             let batch_len = rows.len();
             report.entries_examined += batch_len;
 
-            // Update cursor BEFORE processing (so even if batch processing
-            // partially fails, we do not re-read the same batch on retry).
+            // Advance the cursor before processing so the current invocation
+            // does not revisit already-fetched rows. The cursor is in-memory
+            // only; if this invocation fails, a subsequent prune call starts
+            // scanning from the beginning. Previously committed deletions
+            // remain absent, while uncommitted records are re-evaluated.
             let last_row_id: String = rows[batch_len - 1].get("id");
             last_seen_id = last_row_id;
 
