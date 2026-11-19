@@ -5,7 +5,7 @@ use ai_memory_adapter::{
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::json;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, Row};
 use std::{path::PathBuf, time::Duration};
 use uuid::Uuid;
 
