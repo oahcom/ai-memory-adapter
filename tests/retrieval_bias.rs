@@ -5,17 +5,6 @@
 //
 // Run:
 //   cargo test --test retrieval_bias -- --nocapture
-//
-// Candidate-stage measurement:
-// Integration tests compile the library without cfg(test), so the
-// crate::test_support::LAST_QUERY_CANDIDATE_COUNT symbol is unavailable.
-// We independently execute the production candidate SELECT, including
-// its session filter, ORDER BY, and LIMIT, before calling query().
-// This SQL must stay in sync with SqliteStorage::query().
-// We compare candidate IDs against explicit ground-truth IDs.
-//
-// After every query execution, timestamps and access counts are restored
-// so repeated measurements cannot contaminate subsequent measurements.
 
 use std::{
     collections::HashSet,
@@ -29,7 +18,7 @@ use ai_memory_adapter::{
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::json;
-use sqlx::Row;
+use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 const SESSION_ID: &str = "retrieval-bias-benchmark";
@@ -37,6 +26,12 @@ const SESSION_ID: &str = "retrieval-bias-benchmark";
 const QUERY_LIMIT: usize = 10;
 const CANDIDATE_LIMIT: usize = 100;
 const THRESHOLD: f32 = 0.8;
+
+fn latency_measurement_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 const QUERY_COUNT: usize = 4;
 
@@ -56,6 +51,23 @@ const QUERIES: [(&str, &str); QUERY_COUNT] = [
     ("nebula routing", "nebula"),
     ("crystal indexing", "crystal"),
 ];
+
+const QUOTA_PAIRS: [(usize, usize); 8] = [
+    (90, 10),
+    (80, 20),
+    (70, 30),
+    (60, 40),
+    (50, 50),
+    (40, 60),
+    (30, 70),
+    (20, 80),
+];
+
+const PHASE_A_OLDER_RELEVANT_TOTAL: usize =
+    QUERY_COUNT * OLD_RELEVANT_PER_QUERY;
+
+const PHASE_A_RELEVANT_TOTAL: usize =
+    QUERY_COUNT * (OLD_RELEVANT_PER_QUERY + RECENT_RELEVANT_PER_QUERY);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Category {
@@ -144,7 +156,6 @@ fn build_dataset() -> Dataset {
     let mut entries = Vec::new();
     let mut ground_truth = Vec::new();
 
-    // UUID namespaces are deterministic and disjoint by category.
     let mut old_relevant_counter = 1u128;
     let mut recent_relevant_counter = 10_000u128;
     let mut distractor_counter = 20_000u128;
@@ -154,8 +165,6 @@ fn build_dataset() -> Dataset {
         let mut expected_relevant = HashSet::new();
         let mut older_relevant = HashSet::new();
 
-        // Category A: older relevant memories.
-        // These have exact query terms but substantially older access times.
         for index in 0..OLD_RELEVANT_PER_QUERY {
             let id = deterministic_id(old_relevant_counter);
             old_relevant_counter += 1;
@@ -173,8 +182,6 @@ fn build_dataset() -> Dataset {
             older_relevant.insert(id);
         }
 
-        // Category B: recent relevant memories.
-        // Their timestamps put them ahead of all distractors.
         for index in 0..RECENT_RELEVANT_PER_QUERY {
             let id = deterministic_id(recent_relevant_counter);
             recent_relevant_counter += 1;
@@ -191,9 +198,6 @@ fn build_dataset() -> Dataset {
             expected_relevant.insert(id);
         }
 
-        // Category C: recent irrelevant distractors.
-        // They intentionally do not contain any query's distinctive topic.
-        // There are more than 100 newer distractors per query.
         for index in 0..RECENT_DISTRACTORS_PER_QUERY {
             let id = deterministic_id(distractor_counter);
             distractor_counter += 1;
@@ -214,7 +218,6 @@ fn build_dataset() -> Dataset {
             ));
         }
 
-        // Category D: older irrelevant memories.
         for index in 0..OLD_IRRELEVANT_PER_QUERY {
             let id = deterministic_id(old_irrelevant_counter);
             old_irrelevant_counter += 1;
@@ -244,21 +247,15 @@ fn build_dataset() -> Dataset {
     }
 }
 
-// Reproduce the session-filtered candidate SELECT used by
-// SqliteStorage::query().
-//
-// IMPORTANT: Keep this SQL synchronized with the production query()
-// implementation. In particular, preserve the session filter,
-// ordering, and candidate limit.
-//
-// This executes before query(), because query() updates last_accessed
-// for returned entries.
 async fn fetch_candidate_ids(
     storage: &SqliteStorage,
     session_id: &str,
     candidate_limit: usize,
 ) -> Vec<Uuid> {
-    let rows = sqlx::query(
+    let older_slots = ((candidate_limit * 20) / 100).max(1);
+    let recent_slots = candidate_limit - older_slots;
+
+    let recent_rows = sqlx::query(
         "SELECT id, session_id, content, embedding_json, metadata_json,
                 created_at, access_count, last_accessed
          FROM memories
@@ -267,24 +264,39 @@ async fn fetch_candidate_ids(
          LIMIT ?",
     )
     .bind(session_id)
-    .bind(candidate_limit as i64)
+    .bind(recent_slots as i64)
     .fetch_all(storage.pool())
     .await
-    .expect("candidate-stage SQL must succeed");
+    .expect("recent-layer candidate SQL must succeed");
 
-    rows.iter()
-        .map(|row| {
-            let id: String = row.get("id");
-            Uuid::parse_str(&id).expect("valid stored UUID")
-        })
-        .collect()
+    let older_rows = sqlx::query(
+        "SELECT id, session_id, content, embedding_json, metadata_json,
+                created_at, access_count, last_accessed
+         FROM memories
+         WHERE session_id = ?
+         ORDER BY last_accessed ASC, id ASC
+         LIMIT ?",
+    )
+    .bind(session_id)
+    .bind(older_slots as i64)
+    .fetch_all(storage.pool())
+    .await
+    .expect("older-layer candidate SQL must succeed");
+
+    let mut seen_ids = std::collections::HashSet::<String>::new();
+    let mut candidate_ids = Vec::with_capacity(candidate_limit);
+
+    for row in recent_rows.into_iter().chain(older_rows) {
+        let id: String = row.get("id");
+
+        if seen_ids.insert(id.clone()) {
+            candidate_ids.push(Uuid::parse_str(&id).expect("valid stored UUID"));
+        }
+    }
+
+    candidate_ids
 }
 
-// Restore original deterministic access timestamps and access counts
-// after query() has performed its normal access-accounting updates.
-//
-// Restoring both fields ensures each iteration starts from the same
-// fixture state.
 async fn restore_timestamps(
     storage: &SqliteStorage,
     entries: &[MemoryEntry],
@@ -319,8 +331,6 @@ fn percentile(values: &[u128], percentile: f64) -> u128 {
     let mut sorted = values.to_vec();
     sorted.sort_unstable();
 
-    // Nearest-rank percentile:
-    // rank = ceil(percentile * sample_count), using one-based indexing.
     let rank = ((percentile * sorted.len() as f64).ceil() as usize)
         .max(1)
         .min(sorted.len());
@@ -347,6 +357,302 @@ fn category_count(entries: &[MemoryEntry], category: Category) -> usize {
         .count()
 }
 
+// -----------------------------------------------------------------------------
+// Phase A helpers: explicitly layered candidate selection and lexical scoring.
+// -----------------------------------------------------------------------------
+
+/// Select recent and older candidates independently.
+///
+/// Recent:
+///   ORDER BY last_accessed DESC, id DESC LIMIT recent_slots
+///
+/// Older:
+///   ORDER BY last_accessed ASC, id ASC LIMIT older_slots
+///
+/// The two result sets are merged by ID. This deliberately does NOT use
+/// one global recency ordering followed by slicing.
+async fn fetch_layered_candidates(
+    pool: &SqlitePool,
+    session_id: &str,
+    recent_slots: usize,
+    older_slots: usize,
+) -> Vec<MemoryEntry> {
+    let recent_rows = sqlx::query(
+        "SELECT id, session_id, content, embedding_json, metadata_json,
+                created_at, access_count, last_accessed
+         FROM memories
+         WHERE session_id = ?
+         ORDER BY last_accessed DESC, id DESC
+         LIMIT ?",
+    )
+    .bind(session_id)
+    .bind(recent_slots as i64)
+    .fetch_all(pool)
+    .await
+    .expect("recent-layer SQL must succeed");
+
+    let older_rows = sqlx::query(
+        "SELECT id, session_id, content, embedding_json, metadata_json,
+                created_at, access_count, last_accessed
+         FROM memories
+         WHERE session_id = ?
+         ORDER BY last_accessed ASC, id ASC
+         LIMIT ?",
+    )
+    .bind(session_id)
+    .bind(older_slots as i64)
+    .fetch_all(pool)
+    .await
+    .expect("older-layer SQL must succeed");
+
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::with_capacity(recent_slots + older_slots);
+
+    for row in recent_rows.into_iter().chain(older_rows) {
+        let id_text: String = row.get("id");
+
+        if !seen.insert(id_text.clone()) {
+            continue;
+        }
+
+        let embedding_text: Option<String> = row.get("embedding_json");
+        let embedding = embedding_text
+            .map(|value| serde_json::from_str::<Vec<f32>>(&value))
+            .transpose()
+            .expect("valid embedding JSON");
+
+        let metadata_text: String = row.get("metadata_json");
+        let metadata = serde_json::from_str(&metadata_text)
+            .expect("valid metadata JSON");
+
+        let created_at_text: String = row.get("created_at");
+        let last_accessed_text: String = row.get("last_accessed");
+
+        let created_at = DateTime::parse_from_rfc3339(&created_at_text)
+            .expect("valid created_at")
+            .with_timezone(&Utc);
+
+        let last_accessed = DateTime::parse_from_rfc3339(&last_accessed_text)
+            .expect("valid last_accessed")
+            .with_timezone(&Utc);
+
+        candidates.push(MemoryEntry {
+            id: Uuid::parse_str(&id_text).expect("valid stored UUID"),
+            session_id: row.get("session_id"),
+            content: row.get("content"),
+            embedding,
+            metadata,
+            created_at,
+            access_count: row.get("access_count"),
+            last_accessed,
+        });
+    }
+
+    candidates
+}
+
+/// Same tokenization and lexical matching semantics as the SQLite storage
+/// implementation. Kept locally because production scoring helpers are private.
+fn tokenize(text: &str) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+
+    for segment in text.split(|character: char| !character.is_alphanumeric()) {
+        if !segment.is_empty() {
+            tokens.insert(segment.to_lowercase());
+        }
+    }
+
+    tokens
+}
+
+fn lexical_score(query_tokens: &HashSet<String>, content: &str) -> f32 {
+    if query_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let content_tokens = tokenize(content);
+
+    let matched = query_tokens
+        .iter()
+        .filter(|token| content_tokens.contains(*token))
+        .count();
+
+    matched as f32 / query_tokens.len() as f32
+}
+
+/// Reproduce the production scoring, sorting and truncation stages against
+/// the explicitly selected candidate set.
+fn score_layered_candidates(
+    candidates: &[MemoryEntry],
+    query_text: &str,
+    threshold: f32,
+    limit: usize,
+) -> Vec<Uuid> {
+    let query_tokens = tokenize(query_text);
+
+    let mut matches: Vec<(f32, &MemoryEntry)> = candidates
+        .iter()
+        .filter_map(|entry| {
+            let score = lexical_score(&query_tokens, &entry.content);
+
+            if score >= threshold {
+                Some((score, entry))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    matches.sort_by(|(score_a, entry_a), (score_b, entry_b)| {
+        score_b
+            .total_cmp(score_a)
+            .then_with(|| entry_b.created_at.cmp(&entry_a.created_at))
+    });
+
+    matches
+        .into_iter()
+        .take(limit)
+        .map(|(_, entry)| entry.id)
+        .collect()
+}
+
+#[derive(Debug)]
+struct QuotaResult {
+    recent_slots: usize,
+    older_slots: usize,
+    older_recall: f64,
+    candidate_recall: f64,
+    recall_at_10: f64,
+    p50_us: u128,
+    p95_us: u128,
+}
+
+async fn measure_quota(
+    storage: &SqliteStorage,
+    dataset: &Dataset,
+    recent_slots: usize,
+    older_slots: usize,
+) -> QuotaResult {
+    assert_eq!(recent_slots + older_slots, CANDIDATE_LIMIT);
+
+    let mut candidate_relevant_total = 0usize;
+    let mut candidate_older_relevant_total = 0usize;
+    let mut recall_at_10_total = 0usize;
+
+    // Candidate-stage measurements use one independently selected layered
+    // candidate set. The denominator is the full ground-truth corpus.
+    let candidates = fetch_layered_candidates(
+        storage.pool(),
+        SESSION_ID,
+        recent_slots,
+        older_slots,
+    )
+    .await;
+
+    let candidate_ids: HashSet<Uuid> =
+        candidates.iter().map(|entry| entry.id).collect();
+
+    for truth in &dataset.ground_truth {
+        candidate_relevant_total += truth
+            .expected_relevant
+            .intersection(&candidate_ids)
+            .count();
+
+        candidate_older_relevant_total += truth
+            .older_relevant
+            .intersection(&candidate_ids)
+            .count();
+
+        let result_ids = score_layered_candidates(
+            &candidates,
+            truth.query_text,
+            THRESHOLD,
+            QUERY_LIMIT,
+        );
+
+        recall_at_10_total += result_ids
+            .iter()
+            .filter(|id| truth.expected_relevant.contains(id))
+            .count();
+    }
+
+    // Each quota gets its own complete warm-up and measurement phase.
+    // Latency samples are 30 iterations x 4 queries = 120.
+    let mut latency_samples_micros = Vec::with_capacity(
+        MEASURED_ITERATIONS * QUERY_COUNT,
+    );
+
+    for _ in 0..WARMUP_ITERATIONS {
+        for truth in &dataset.ground_truth {
+            let candidates = fetch_layered_candidates(
+                storage.pool(),
+                SESSION_ID,
+                recent_slots,
+                older_slots,
+            )
+            .await;
+
+            let _ = score_layered_candidates(
+                &candidates,
+                truth.query_text,
+                THRESHOLD,
+                QUERY_LIMIT,
+            );
+        }
+    }
+
+    for _ in 0..MEASURED_ITERATIONS {
+        for truth in &dataset.ground_truth {
+            let start = Instant::now();
+
+            let candidates = fetch_layered_candidates(
+                storage.pool(),
+                SESSION_ID,
+                recent_slots,
+                older_slots,
+            )
+            .await;
+
+            let _ = score_layered_candidates(
+                &candidates,
+                truth.query_text,
+                THRESHOLD,
+                QUERY_LIMIT,
+            );
+
+            latency_samples_micros.push(start.elapsed().as_micros());
+        }
+    }
+
+    assert_eq!(
+        latency_samples_micros.len(),
+        MEASURED_ITERATIONS * QUERY_COUNT
+    );
+
+    QuotaResult {
+        recent_slots,
+        older_slots,
+        older_recall: percentage(
+            candidate_older_relevant_total,
+            PHASE_A_OLDER_RELEVANT_TOTAL,
+        ),
+        candidate_recall: percentage(
+            candidate_relevant_total,
+            PHASE_A_RELEVANT_TOTAL,
+        ),
+        recall_at_10: percentage(
+            recall_at_10_total,
+            PHASE_A_RELEVANT_TOTAL,
+        ),
+        p50_us: percentile(&latency_samples_micros, 0.50),
+        p95_us: percentile(&latency_samples_micros, 0.95),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Original P1-03 measurement. Retained independently of Phase A.
+// -----------------------------------------------------------------------------
+
 #[tokio::test]
 async fn measure_recency_candidate_selection_bias() {
     let dataset = build_dataset();
@@ -357,7 +663,6 @@ async fn measure_recency_candidate_selection_bias() {
             + RECENT_DISTRACTORS_PER_QUERY
             + OLD_IRRELEVANT_PER_QUERY);
 
-    // 4 * (5 + 2 + 105 + 10) = 488 entries.
     assert_eq!(expected_corpus_size, 488);
     assert_eq!(dataset.entries.len(), expected_corpus_size);
 
@@ -365,6 +670,8 @@ async fn measure_recency_candidate_selection_bias() {
         CANDIDATE_LIMIT,
         QUERY_LIMIT.saturating_mul(10).clamp(100, 1000)
     );
+
+    let _measurement_guard = latency_measurement_lock().lock().await;
 
     let database_path = env::temp_dir().join(format!(
         "ai-memory-adapter-retrieval-bias-{}.sqlite",
@@ -379,7 +686,6 @@ async fn measure_recency_candidate_selection_bias() {
         .await
         .expect("open benchmark database");
 
-    // Insert the entire deterministic corpus.
     for entry in &dataset.entries {
         storage
             .store(entry.clone())
@@ -387,7 +693,6 @@ async fn measure_recency_candidate_selection_bias() {
             .expect("store benchmark entry");
     }
 
-    // Verify all four dataset categories are represented.
     assert_eq!(
         category_count(&dataset.entries, Category::OlderRelevant),
         QUERY_COUNT * OLD_RELEVANT_PER_QUERY
@@ -416,14 +721,12 @@ async fn measure_recency_candidate_selection_bias() {
             threshold: THRESHOLD,
         };
 
-        // Stage 1: Measure the actual candidate set before scoring.
         let candidate_ids =
             fetch_candidate_ids(&storage, SESSION_ID, CANDIDATE_LIMIT).await;
 
         let candidate_set: HashSet<Uuid> =
             candidate_ids.iter().copied().collect();
 
-        // Candidate count must never exceed the production candidate limit.
         assert!(
             candidate_ids.len() <= CANDIDATE_LIMIT,
             "candidate-stage row count exceeded candidate_limit for {}",
@@ -440,8 +743,6 @@ async fn measure_recency_candidate_selection_bias() {
             .intersection(&candidate_set)
             .count();
 
-        // Stage 2: Capture one independent end-to-end result set for
-        // Recall@K evaluation.
         let results = storage
             .query(&query)
             .await
@@ -455,7 +756,6 @@ async fn measure_recency_candidate_selection_bias() {
         let result_ids: Vec<Uuid> =
             results.iter().map(|entry| entry.id).collect();
 
-        // All results must belong to the candidate set measured above.
         for id in &result_ids {
             assert!(
                 candidate_set.contains(id),
@@ -464,7 +764,6 @@ async fn measure_recency_candidate_selection_bias() {
             );
         }
 
-        // Restore fixture state before any further execution.
         restore_timestamps(&storage, &dataset.entries).await;
 
         measurements.push(Measurement {
@@ -476,9 +775,6 @@ async fn measure_recency_candidate_selection_bias() {
             result_ids,
         });
 
-        // Warm-up phase.
-        // These executions are deliberately discarded and do not contribute
-        // to the latency distribution.
         for _ in 0..WARMUP_ITERATIONS {
             let results = storage
                 .query(&query)
@@ -493,8 +789,6 @@ async fn measure_recency_candidate_selection_bias() {
             restore_timestamps(&storage, &dataset.entries).await;
         }
 
-        // Measurement phase.
-        // Each iteration starts from the original deterministic fixture.
         for _ in 0..MEASURED_ITERATIONS {
             let start = Instant::now();
 
@@ -516,40 +810,33 @@ async fn measure_recency_candidate_selection_bias() {
         }
     }
 
-    // Aggregate candidate-stage recall.
     let total_relevant: usize = measurements
         .iter()
-        .map(|m| m.relevant_total)
+        .map(|measurement| measurement.relevant_total)
         .sum();
 
     let total_candidate_relevant: usize = measurements
         .iter()
-        .map(|m| m.candidate_relevant)
+        .map(|measurement| measurement.candidate_relevant)
         .sum();
 
     let total_older_relevant: usize = measurements
         .iter()
-        .map(|m| m.older_relevant_total)
+        .map(|measurement| measurement.older_relevant_total)
         .sum();
 
     let total_candidate_older_relevant: usize = measurements
         .iter()
-        .map(|m| m.candidate_older_relevant)
+        .map(|measurement| measurement.candidate_older_relevant)
         .sum();
 
-    let candidate_recall = percentage(
-        total_candidate_relevant,
-        total_relevant,
-    );
+    let candidate_recall =
+        percentage(total_candidate_relevant, total_relevant);
 
-    let older_candidate_recall = percentage(
-        total_candidate_older_relevant,
-        total_older_relevant,
-    );
+    let older_candidate_recall =
+        percentage(total_candidate_older_relevant, total_older_relevant);
 
-    // End-to-end Recall@K.
     let recall_ks = [1usize, 3, 5, 10];
-
     let mut recall_totals = [0usize; 4];
 
     for measurement in &measurements {
@@ -569,7 +856,6 @@ async fn measure_recency_candidate_selection_bias() {
         }
     }
 
-    // Four queries * 30 measured iterations = 120 latency samples.
     let expected_latency_samples = QUERY_COUNT * MEASURED_ITERATIONS;
 
     assert_eq!(
@@ -580,7 +866,6 @@ async fn measure_recency_candidate_selection_bias() {
     let p50 = percentile(&latency_samples_micros, 0.50);
     let p95 = percentile(&latency_samples_micros, 0.95);
 
-    // Per-query report.
     println!();
     println!("========== RETRIEVAL BIAS MEASUREMENT ==========");
     println!("Repository baseline: a5b9039");
@@ -625,10 +910,7 @@ async fn measure_recency_candidate_selection_bias() {
         println!("------------------------------------------------");
         println!("Query: {}", measurement.query_text);
         println!("Topic: {}", truth.topic);
-        println!(
-            "Ground-truth relevant: {}",
-            measurement.relevant_total
-        );
+        println!("Ground-truth relevant: {}", measurement.relevant_total);
         println!(
             "Candidate-stage relevant: {}/{} ({:.2}%)",
             measurement.candidate_relevant,
@@ -684,9 +966,6 @@ async fn measure_recency_candidate_selection_bias() {
     );
 
     for (index, k) in recall_ks.iter().enumerate() {
-        // Micro-averaged Recall@K:
-        // total hits across all queries / total relevant items across all queries.
-        // total_relevant already sums the ground truth for every query.
         println!(
             "Recall@{}: {:.4} ({}/{})",
             k,
@@ -775,8 +1054,6 @@ async fn measure_recency_candidate_selection_bias() {
     println!("================================================");
     println!();
 
-    // Structural assertions: these invariants hold independently of
-    // whether the measured outcome is CHANGE_REQUIRED or NO_CHANGE.
     assert_eq!(
         total_relevant,
         QUERY_COUNT * (
@@ -789,10 +1066,7 @@ async fn measure_recency_candidate_selection_bias() {
         QUERY_COUNT * OLD_RELEVANT_PER_QUERY
     );
 
-    assert_eq!(
-        measurements.len(),
-        QUERY_COUNT
-    );
+    assert_eq!(measurements.len(), QUERY_COUNT);
 
     assert_eq!(
         latency_samples_micros.len(),
@@ -814,6 +1088,117 @@ async fn measure_recency_candidate_selection_bias() {
                 <= measurement.older_relevant_total),
         "candidate older-relevant count cannot exceed older-relevant total"
     );
+
+    drop(storage);
+
+    let _ = std::fs::remove_file(&database_path);
+    let _ = std::fs::remove_file(format!("{}-shm", database_path.display()));
+    let _ = std::fs::remove_file(format!("{}-wal", database_path.display()));
+}
+
+// -----------------------------------------------------------------------------
+// Phase A: candidate quota sensitivity measurement.
+// This is measurement-only: no performance or recall acceptance assertions.
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn measure_layered_candidate_quota_sensitivity() {
+    let dataset = build_dataset();
+
+    assert_eq!(dataset.entries.len(), 488);
+    assert_eq!(PHASE_A_OLDER_RELEVANT_TOTAL, 20);
+    assert_eq!(PHASE_A_RELEVANT_TOTAL, 28);
+
+    let _measurement_guard = latency_measurement_lock().lock().await;
+
+    let database_path = env::temp_dir().join(format!(
+        "ai-memory-adapter-quota-sensitivity-{}.sqlite",
+        std::process::id()
+    ));
+
+    let _ = std::fs::remove_file(&database_path);
+    let _ = std::fs::remove_file(format!("{}-shm", database_path.display()));
+    let _ = std::fs::remove_file(format!("{}-wal", database_path.display()));
+
+    let storage = SqliteStorage::open(&database_path)
+        .await
+        .expect("open quota sensitivity database");
+
+    for entry in &dataset.entries {
+        storage
+            .store(entry.clone())
+            .await
+            .expect("store quota sensitivity fixture");
+    }
+
+    println!();
+    println!("========== PHASE A: QUOTA SENSITIVITY ==========");
+    println!("Corpus size: {}", dataset.entries.len());
+    println!("Candidate limit: {}", CANDIDATE_LIMIT);
+    println!("Query count: {}", QUERY_COUNT);
+    println!("Older-relevant denominator: {}", PHASE_A_OLDER_RELEVANT_TOTAL);
+    println!("Candidate-stage denominator: {}", PHASE_A_RELEVANT_TOTAL);
+    println!("Query limit: {}", QUERY_LIMIT);
+    println!("Threshold: {:.2}", THRESHOLD);
+    println!("Warm-up iterations per query and quota: {}", WARMUP_ITERATIONS);
+    println!("Measured iterations per query and quota: {}", MEASURED_ITERATIONS);
+    println!("Latency samples per quota: {}", QUERY_COUNT * MEASURED_ITERATIONS);
+    println!("Percentile method: nearest-rank");
+    println!();
+
+    println!(
+        "| recent_slots | older_slots | older_recall% | cand_recall% | Recall@10 | p50us | p95us |"
+    );
+    println!(
+        "|---:|---:|---:|---:|---:|---:|---:|"
+    );
+
+    let mut results = Vec::with_capacity(QUOTA_PAIRS.len());
+
+    for (recent_slots, older_slots) in QUOTA_PAIRS {
+        let result = measure_quota(
+            &storage,
+            &dataset,
+            recent_slots,
+            older_slots,
+        )
+        .await;
+
+        println!(
+            "| {} | {} | {:.2}% | {:.2}% | {:.2}% | {} | {} |",
+            result.recent_slots,
+            result.older_slots,
+            result.older_recall,
+            result.candidate_recall,
+            result.recall_at_10,
+            result.p50_us,
+            result.p95_us
+        );
+
+        results.push(result);
+    }
+
+    let recommended = results
+        .iter()
+        .filter(|result| {
+            result.older_recall >= OLDER_CANDIDATE_RECALL_THRESHOLD_PERCENT
+                && result.p95_us <= 6_000
+        })
+        .max_by_key(|result| result.recent_slots);
+
+    match recommended {
+        Some(result) => println!(
+            "RECOMMENDED: (recent, older) = ({}, {})",
+            result.recent_slots,
+            result.older_slots
+        ),
+        None => println!(
+            "RECOMMENDED: NONE — escalate to Owner"
+        ),
+    }
+
+    println!("================================================");
+    println!();
 
     drop(storage);
 
