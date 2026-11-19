@@ -16,7 +16,9 @@ use crate::pruning::{EbbinghausPolicy, PruneReport};
 /// Maximum number of candidate records fetched from the database for scoring.
 /// The query() function loads at most this many records before applying
 /// relevance scoring and truncating to the caller's requested limit.
-/// This bounds memory usage and prevents unbounded full-table scans.
+/// This bounds memory usage and the number of candidates scored in Rust.
+/// Note: this bounds fetched/scored rows, not necessarily database rows examined;
+/// the composite indexes ensure the database can serve the bounded query efficiently.
 pub const MAX_QUERY_CANDIDATES: usize = 1000;
 
 /// Number of records processed per batch in Ebbinghaus pruning.
@@ -70,6 +72,22 @@ impl SqliteStorage {
             .await
             .map_err(storage_error)?;
 
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memories_session_last_accessed_id
+             ON memories(session_id, last_accessed DESC, id DESC)",
+        )
+        .execute(&pool)
+        .await
+        .map_err(storage_error)?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memories_last_accessed_id
+             ON memories(last_accessed DESC, id DESC)",
+        )
+        .execute(&pool)
+        .await
+        .map_err(storage_error)?;
+
         Ok(Self { pool })
     }
 
@@ -82,8 +100,10 @@ impl SqliteStorage {
     /// Uses keyset pagination over the primary key to process records in bounded
     /// batches (PRUNE_BATCH_SIZE per batch). Each batch runs in its own short
     /// transaction. DELETE includes optimistic concurrency checks on
-    /// `last_accessed` and `access_count` to avoid deleting records modified
-    /// since they were read.
+    /// `last_accessed` and `access_count` to avoid deleting records whose
+    /// access metadata changed since they were read. Note: this protects
+    /// access-state modifications (query/inject_context calls), not arbitrary
+    /// field changes like content or metadata.
     ///
     /// **Important semantics:** This is NOT atomic across batches. If an error
     /// occurs mid-run, previously committed batches remain committed (NOT rolled back).
