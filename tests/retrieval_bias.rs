@@ -865,6 +865,8 @@ struct SweepResult {
     threshold: Option<f32>,
     recall_at_10: f64,
     candidate_recall: f64,
+    returned_rows_total: usize,
+    returned_rows_mean: f64,
     p50_us: u128,
     p95_us: u128,
     chinese_pass: usize,
@@ -1289,6 +1291,7 @@ async fn measure_threshold(dataset: &Dataset, threshold: Option<f32>, label: &st
 
     let mut relevant_hits = 0usize;
     let mut candidate_hits = 0usize;
+    let mut returned_rows_total = 0usize;
     let mut latency_samples = Vec::with_capacity(QUERY_COUNT * MEASURED_ITERATIONS);
 
     for truth in &dataset.ground_truth {
@@ -1340,12 +1343,13 @@ async fn measure_threshold(dataset: &Dataset, threshold: Option<f32>, label: &st
         for _ in 0..MEASURED_ITERATIONS {
             let start = Instant::now();
 
-            let _ = storage
+            let results = storage
                 .query(&query)
                 .await
                 .expect("measured threshold query must succeed");
 
             latency_samples.push(start.elapsed().as_micros());
+            returned_rows_total += results.len();
 
             restore_timestamps(&storage, &dataset.entries).await;
         }
@@ -1365,6 +1369,8 @@ async fn measure_threshold(dataset: &Dataset, threshold: Option<f32>, label: &st
         threshold,
         recall_at_10,
         candidate_recall,
+        returned_rows_total,
+        returned_rows_mean: returned_rows_total as f64 / (QUERY_COUNT * MEASURED_ITERATIONS) as f64,
         p50_us,
         p95_us,
         chinese_pass,
@@ -1421,17 +1427,32 @@ async fn measure_threshold_sweep() {
     results.push(adaptive);
 
     println!();
-    println!("| threshold | Recall@10 | cand_recall% | p50us | p95us |");
-    println!("|---|---:|---:|---:|---:|");
+    println!(
+        "| threshold | Recall@10 | cand_recall% | returned_rows | mean_rows | p50us | p95us |"
+    );
+    println!("|---|---:|---:|---:|---:|---:|---:|");
 
     for result in &results {
         println!(
-            "| {} | {:.2}% | {:.2}% | {} | {} |",
+            "| {} | {:.2}% | {:.2}% | {} | {:.2} | {} | {} |",
             result.label,
             result.recall_at_10,
             result.candidate_recall,
+            result.returned_rows_total,
+            result.returned_rows_mean,
             result.p50_us,
             result.p95_us
+        );
+    }
+
+    println!();
+    println!("| threshold | mean_rows | p50us |");
+    println!("|---|---:|---:|");
+
+    for result in &results {
+        println!(
+            "| {} | {:.2} | {} |",
+            result.label, result.returned_rows_mean, result.p50_us
         );
     }
 
