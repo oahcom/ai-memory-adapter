@@ -31,8 +31,7 @@ impl Drop for PruneDeleteHookGuard {
 type SchemaMigrationHook = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 static SCHEMA_MIGRATION_TEST_HOOK: Mutex<Option<SchemaMigrationHook>> = Mutex::new(None);
 type SchemaMigrationIndexHook = Arc<dyn Fn(&str, bool) -> Result<(), String> + Send + Sync>;
-static SCHEMA_MIGRATION_INDEX_TEST_HOOK: Mutex<Option<SchemaMigrationIndexHook>> =
-    Mutex::new(None);
+static SCHEMA_MIGRATION_INDEX_TEST_HOOK: Mutex<Option<SchemaMigrationIndexHook>> = Mutex::new(None);
 
 /// Get the schema migration hook that observes in-transaction index visibility.
 pub(crate) fn schema_migration_index_hook() -> Option<SchemaMigrationIndexHook> {
