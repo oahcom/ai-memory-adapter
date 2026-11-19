@@ -927,3 +927,125 @@ async fn query_supports_chinese_and_mixed_language_content() {
 }
 
 // === Additional P0 Evidence Tests: Concurrency, Failure Injection, Scale ===
+
+// Invoked by the parent test in separate OS processes to exercise the first-open
+// migration race against the same legacy SQLite database.
+#[tokio::test]
+async fn concurrent_legacy_migration_worker() {
+    let Ok(database) = std::env::var("AI_MEMORY_MIGRATION_WORKER_DB") else {
+        return;
+    };
+    let ready = std::env::var("AI_MEMORY_MIGRATION_WORKER_READY").unwrap();
+    let go = std::env::var("AI_MEMORY_MIGRATION_WORKER_GO").unwrap();
+    std::fs::write(&ready, "ready").unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !PathBuf::from(&go).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "parent did not release migration workers"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let storage = SqliteStorage::open(database).await.unwrap();
+    let columns = sqlx::query("PRAGMA table_info(memories)")
+        .fetch_all(storage.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        columns
+            .iter()
+            .filter(|row| row.get::<String, _>("name") == "work_item_id")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_processes_migrate_legacy_database_once() {
+    let path = database_path("concurrent-legacy-migration");
+    let options = SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(true)
+        .busy_timeout(Duration::from_secs(15));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE memories (
+            id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            embedding_json TEXT,
+            metadata_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            access_count INTEGER NOT NULL CHECK (access_count >= 0),
+            last_accessed TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO memories
+         (id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed)
+         VALUES ('legacy-id', 'legacy-session', 'legacy content', NULL, '{}',
+                 '2020-01-01T00:00:00Z', 0, '2020-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    drop(pool);
+
+    let executable = std::env::current_exe().unwrap();
+    let ready_a = format!("{}.worker-a.ready", path.display());
+    let ready_b = format!("{}.worker-b.ready", path.display());
+    let go = format!("{}.go", path.display());
+    let spawn_worker = |ready: &str| {
+        std::process::Command::new(&executable)
+            .arg("--exact")
+            .arg("concurrent_legacy_migration_worker")
+            .arg("--nocapture")
+            .env("AI_MEMORY_MIGRATION_WORKER_DB", &path)
+            .env("AI_MEMORY_MIGRATION_WORKER_READY", ready)
+            .env("AI_MEMORY_MIGRATION_WORKER_GO", &go)
+            .spawn()
+            .unwrap()
+    };
+    let mut worker_a = spawn_worker(&ready_a);
+    let mut worker_b = spawn_worker(&ready_b);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !(PathBuf::from(&ready_a).exists() && PathBuf::from(&ready_b).exists()) {
+        if std::time::Instant::now() >= deadline {
+            let _ = worker_a.kill();
+            let _ = worker_b.kill();
+            panic!("migration workers did not reach the start barrier");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    std::fs::write(&go, "go").unwrap();
+
+    let status_a = worker_a.wait().unwrap();
+    let status_b = worker_b.wait().unwrap();
+    assert!(status_a.success(), "first migration worker failed: {status_a}");
+    assert!(status_b.success(), "second migration worker failed: {status_b}");
+
+    let storage = SqliteStorage::open(&path).await.unwrap();
+    let legacy_unscoped: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE id = 'legacy-id' AND work_item_id IS NULL")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+    assert_eq!(legacy_unscoped, 1, "legacy data must remain intact and unscoped");
+
+    drop(storage);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(ready_a);
+    let _ = std::fs::remove_file(ready_b);
+    let _ = std::fs::remove_file(go);
+}
+
