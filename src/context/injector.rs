@@ -72,7 +72,7 @@ fn escape_context_field(value: &str) -> String {
 
 // Escape control characters and backslashes so content cannot create another
 // physical record or forge a literal escape sequence.
-fn escape_context_content(value: &str) -> String {
+pub(crate) fn escape_context_content(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
