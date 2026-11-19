@@ -1,4 +1,4 @@
-# Python
+# Python compatibility / legacy
 __pycache__/
 *.py[cod]
 *$py.class
@@ -7,13 +7,19 @@ __pycache__/
 env/
 venv/
 *.egg-info/
+.pytest_cache/
+.coverage
 
-# Database
+# Rust
+/target/
+**/*.rs.bk
+
+# Databases
 *.db
 *.sqlite
 *.sqlite3
 
-# Vector DB
+# Vector indexes
 *.faiss
 *.index
 
@@ -21,10 +27,6 @@ venv/
 .vscode/
 .idea/
 
-# Tests
-.pytest_cache/
-.coverage
-
-# Temp
+# Logs and temporary files
 *.log
 *.tmp
