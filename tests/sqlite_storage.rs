@@ -1096,5 +1096,3 @@ async fn query_intersects_work_item_and_session_scopes() {
     drop(storage);
     let _ = std::fs::remove_file(path);
 }
-
-[executed on device: MS-QSZMHWTHUAJW (5cf15972-dd57-4115-827c-7c69eeec2bab)]
