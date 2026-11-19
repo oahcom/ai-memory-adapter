@@ -195,4 +195,20 @@ mod tests {
         };
         assert!(query.validate().is_err());
     }
+    #[test]
+    fn empty_work_item_id_is_rejected_for_entries_and_queries() {
+        let mut entry = sample_entry();
+        entry.work_item_id = Some("  ".into());
+        assert!(matches!(entry.validate(), Err(AdapterError::Validation(_))));
+
+        let query = Query {
+            text: "Rust".into(),
+            session_id: None,
+            work_item_id: Some("  ".into()),
+            limit: 5,
+            threshold: 0.5,
+        };
+        assert!(matches!(query.validate(), Err(AdapterError::Validation(_))));
+    }
+
 }
