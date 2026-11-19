@@ -360,6 +360,16 @@ impl MemoryAdapter for SqliteStorage {
         crate::test_support::LAST_QUERY_CANDIDATE_COUNT
             .store(rows.len(), std::sync::atomic::Ordering::SeqCst);
 
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let ids: Vec<uuid::Uuid> = rows
+                .iter()
+                .filter_map(|row| row.try_get::<String, _>("id").ok())
+                .filter_map(|text| uuid::Uuid::parse_str(&text).ok())
+                .collect();
+            crate::test_support::record_query_candidate_ids(ids);
+        }
+
         let query_tokens = tokenize(&query.text);
         let mut matches: Vec<(f32, MemoryEntry)> = Vec::new();
 
