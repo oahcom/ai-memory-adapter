@@ -156,13 +156,25 @@ impl<'a> ContextInjector<'a> {
                     memory.id, work_item_id
                 )));
             }
+            // Encode every untrusted string field as a JSON string. This keeps
+            // embedded newlines/control characters from creating forged physical
+            // provenance records in the line-oriented context representation.
+            let encoded_work_item_id = serde_json::to_string(work_item_id).map_err(|error| {
+                AdapterError::Storage(format!("failed to encode Work Item ID: {error}"))
+            })?;
+            let encoded_session_id = serde_json::to_string(&memory.session_id).map_err(|error| {
+                AdapterError::Storage(format!("failed to encode session ID: {error}"))
+            })?;
+            let encoded_content = serde_json::to_string(&memory.content).map_err(|error| {
+                AdapterError::Storage(format!("failed to encode memory content: {error}"))
+            })?;
             let line = format!(
                 "[memory_id={} work_item_id={} session_id={} created_at={}] {}",
                 memory.id,
-                memory.work_item_id.as_deref().unwrap_or_default(),
-                memory.session_id,
+                encoded_work_item_id,
+                encoded_session_id,
                 memory.created_at.to_rfc3339(),
-                memory.content
+                encoded_content
             );
             let separator_chars = if text.is_empty() { 0 } else { 1 };
             let required_chars = line.chars().count().saturating_add(separator_chars);
