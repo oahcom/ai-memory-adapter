@@ -7,6 +7,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::json;
 use std::{path::PathBuf, time::Duration};
 use uuid::Uuid;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 fn database_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -706,6 +707,80 @@ async fn query_scopes_to_work_item_across_sessions_without_cross_item_leakage() 
     assert_eq!(results.len(), 2);
     assert!(results.iter().all(|e| e.work_item_id.as_deref() == Some("WI-A")));
     assert_eq!(results.iter().map(|e| e.session_id.as_str()).collect::<std::collections::HashSet<_>>().len(), 2);
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn opening_legacy_database_adds_nullable_work_item_scope_without_losing_rows() {
+    let path = database_path("legacy-migration");
+    let now = Utc::now();
+    let legacy_id = Uuid::new_v4();
+    {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE memories (
+                id TEXT PRIMARY KEY NOT NULL,
+                session_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                embedding_json TEXT,
+                metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                access_count INTEGER NOT NULL CHECK (access_count >= 0),
+                last_accessed TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO memories
+             (id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(legacy_id.to_string())
+        .bind("legacy-session")
+        .bind("legacy memory remains readable")
+        .bind(Option::<String>::None)
+        .bind("{}")
+        .bind(now.to_rfc3339())
+        .bind(0_i32)
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+    }
+
+    let storage = SqliteStorage::open(&path).await.unwrap();
+    let legacy = storage.query(&Query {
+        text: "legacy memory remains readable".into(),
+        session_id: Some("legacy-session".into()),
+        work_item_id: None,
+        limit: 5,
+        threshold: 1.0,
+    }).await.unwrap();
+    assert_eq!(legacy.len(), 1);
+    assert_eq!(legacy[0].id, legacy_id);
+    assert_eq!(legacy[0].work_item_id, None);
+
+    let scoped = storage.query(&Query {
+        text: "legacy memory remains readable".into(),
+        session_id: None,
+        work_item_id: Some("WI-A".into()),
+        limit: 5,
+        threshold: 1.0,
+    }).await.unwrap();
+    assert!(scoped.is_empty(), "legacy unscoped records must not enter a named Work Item");
+
     drop(storage);
     let _ = std::fs::remove_file(path);
 }
