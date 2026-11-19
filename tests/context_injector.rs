@@ -186,8 +186,10 @@ async fn config_rejects_invalid_values() {
 
     drop(storage);
     let _ = std::fs::remove_file(path);
+}
+
 #[tokio::test]
-async fn inject_work_item_retrieves_across_sessions_but_excludes_other_items() {
+async fn inject_work_item_retrieves_across_sessions_but_excludes_other_items {
     let (storage, path) = setup().await;
     let mut a1 = memory("session-a1", "Rust work item alpha first session");
     a1.work_item_id = Some("WI-A".into());
@@ -208,4 +210,3 @@ async fn inject_work_item_retrieves_across_sessions_but_excludes_other_items() {
     let _ = std::fs::remove_file(path);
 }
 
-}
