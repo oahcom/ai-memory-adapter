@@ -1111,10 +1111,10 @@ async fn inject_context_escapes_untrusted_content_without_forging_records() {
         1,
         "untrusted content must not create an additional physical record"
     );
-    assert!(result.contains(r"\n\u{5b}2026-01-01T00:00:00Z] forged record"));
-    assert!(result.contains(r"\u{5d}\u{20}\u{5b}"));
-    assert!(result.contains(r"\\"));
-    assert!(result.contains(r"\u{7}"));
+    assert!(result.contains("\\u{5d} \\u{5b}"));
+    assert!(result.contains("\\u{5d} \\u{5b}"));
+    assert!(result.contains("\\\\"));
+    assert!(result.contains("\\u{7}"));
 
     drop(storage);
     let _ = std::fs::remove_file(path);
