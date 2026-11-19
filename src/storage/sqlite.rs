@@ -25,12 +25,6 @@ pub const MAX_QUERY_CANDIDATES: usize = 1000;
 /// Each batch runs in its own short transaction to avoid long-running locks.
 pub const PRUNE_BATCH_SIZE: usize = 256;
 
-/// Test-only observer for the number of candidate rows fetched in query().
-/// Not part of the public API; for integration testing only.
-#[doc(hidden)]
-pub static LAST_QUERY_CANDIDATE_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 pub struct SqliteStorage {
     pool: SqlitePool,
 }
@@ -322,7 +316,9 @@ impl MemoryAdapter for SqliteStorage {
                 .map_err(storage_error)?
         };
 
-        LAST_QUERY_CANDIDATE_COUNT.store(rows.len(), std::sync::atomic::Ordering::SeqCst);
+        #[cfg(test)]
+        crate::test_support::LAST_QUERY_CANDIDATE_COUNT
+            .store(rows.len(), std::sync::atomic::Ordering::SeqCst);
 
         let query_tokens = tokenize(&query.text);
         let mut matches: Vec<(f32, MemoryEntry)> = Vec::new();
@@ -668,6 +664,42 @@ mod tests {
             .unwrap()
             .get(0);
         assert_eq!(count2, 0, "all records must be deleted after retry");
+    }
+
+    /// Verify MAX_QUERY_CANDIDATES=1000 hard cap at the SQL fetch boundary.
+    /// Uses LAST_QUERY_CANDIDATE_COUNT observer (in test_support, cfg(test) only).
+    #[tokio::test]
+    #[ignore = "global observer; run with --ignored --test-threads=1"]
+    async fn query_max_candidate_limit_1000_is_enforced() {
+        let (storage, _path) = open_test_db("max-cand").await;
+        let session = "max-candidate";
+
+        for i in 0..1500 {
+            let e = test_entry(
+                session,
+                &format!("unique special keyword item number {}", i),
+            );
+            storage.store(e).await.unwrap();
+        }
+
+        // limit=200 -> candidate_limit = clamp(2000, 100, 1000) = 1000
+        let q = Query {
+            text: "special keyword".into(),
+            session_id: Some(session.into()),
+            limit: 200,
+            threshold: 0.0,
+        };
+        let results = storage.query(&q).await.unwrap();
+        assert!(results.len() <= 200, "must respect limit=200");
+
+        // Directly verify the SQL candidate fetch count
+        let observed = crate::test_support::LAST_QUERY_CANDIDATE_COUNT
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed, 1000,
+            "SQL must fetch exactly MAX_QUERY_CANDIDATES=1000, got {}",
+            observed
+        );
     }
 
     /// Report accounting identity: examined == deleted + retained (no skips).

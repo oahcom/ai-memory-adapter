@@ -78,3 +78,7 @@ impl SyncBarrier {
         *self.proceed.lock().unwrap() = true;
     }
 }
+
+/// Test-only observer for query() candidate fetch count.
+pub(crate) static LAST_QUERY_CANDIDATE_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
