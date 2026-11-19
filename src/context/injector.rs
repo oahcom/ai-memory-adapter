@@ -58,7 +58,7 @@ pub struct ContextResult {
 }
 
 // Encode untrusted metadata fields so structural delimiters cannot be injected.
-fn escape_context_field(value: &str) -> String {
+pub(crate) fn escape_context_field(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
         if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
