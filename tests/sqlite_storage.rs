@@ -1049,3 +1049,40 @@ async fn concurrent_processes_migrate_legacy_database_once() {
     let _ = std::fs::remove_file(go);
 }
 
+#[tokio::test]
+async fn query_intersects_work_item_and_session_scopes() {
+    let (storage, path) = open_db("work-item-session-intersection").await;
+
+    let mut target = entry("session-a", "Rust shared scope target");
+    target.work_item_id = Some("WI-A".into());
+    let mut same_work_item_other_session =
+        entry("session-b", "Rust shared scope other session");
+    same_work_item_other_session.work_item_id = Some("WI-A".into());
+    let mut same_session_other_work_item =
+        entry("session-a", "Rust shared scope other work item");
+    same_session_other_work_item.work_item_id = Some("WI-B".into());
+
+    storage.store(target).await.unwrap();
+    storage.store(same_work_item_other_session).await.unwrap();
+    storage.store(same_session_other_work_item).await.unwrap();
+
+    let results = storage
+        .query(&Query {
+            text: "Rust shared scope".into(),
+            session_id: Some("session-a".into()),
+            work_item_id: Some("WI-A".into()),
+            limit: 10,
+            threshold: 1.0,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].session_id, "session-a");
+    assert_eq!(results[0].work_item_id.as_deref(), Some("WI-A"));
+    assert_eq!(results[0].content, "Rust shared scope target");
+
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+
