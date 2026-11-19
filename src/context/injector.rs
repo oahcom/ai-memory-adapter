@@ -57,10 +57,22 @@ pub struct ContextResult {
     pub chars_used: usize,
 }
 
-// Escape untrusted values before embedding them in the line-oriented context format.
-// This preserves ordinary printable text while preventing embedded control characters
-// (especially CR/LF) from creating forged physical provenance records.
-fn escape_context_value(value: &str) -> String {
+// Encode untrusted metadata fields so structural delimiters cannot be injected.
+fn escape_context_field(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+            escaped.push(ch);
+        } else {
+            escaped.push_str(&format!("\\u{{{:x}}}", ch as u32));
+        }
+    }
+    escaped
+}
+
+// Escape control characters and backslashes so content cannot create another
+// physical record or forge a literal escape sequence.
+fn escape_context_content(value: &str) -> String {
     value.chars().flat_map(char::escape_default).collect()
 }
 
@@ -106,7 +118,7 @@ impl<'a> ContextInjector<'a> {
         let mut chars_used = 0;
 
         for memory in memories {
-            let line = format!("[{}] {}", memory.created_at.to_rfc3339(), memory.content);
+            let escaped_content = escape_context_content(&memory.content);\n            let line = format!("[{}] {}", memory.created_at.to_rfc3339(), escaped_content);
             let line_chars = line.chars().count();
             let separator_chars = if text.is_empty() { 0 } else { 1 };
             let required_chars = line_chars.saturating_add(separator_chars);
@@ -163,9 +175,9 @@ impl<'a> ContextInjector<'a> {
                     memory.id, work_item_id
                 )));
             }
-            let escaped_work_item_id = escape_context_value(work_item_id);
-            let escaped_session_id = escape_context_value(&memory.session_id);
-            let escaped_content = escape_context_value(&memory.content);
+            let escaped_work_item_id = escape_context_field(work_item_id);
+            let escaped_session_id = escape_context_field(&memory.session_id);
+            let escaped_content = escape_context_content(&memory.content);
             let line = format!(
                 "[memory_id={} work_item_id={} session_id={} created_at={}] {}",
                 memory.id,
