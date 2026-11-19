@@ -500,12 +500,13 @@ fn tokenize(text: &str) -> HashSet<String> {
             return;
         }
         let chars: Vec<char> = run.chars().collect();
-        if chars.len() == 1 {
-            tokens.insert(chars.iter().collect());
-        } else {
-            for pair in chars.windows(2) {
-                tokens.insert(pair.iter().collect());
-            }
+        // Keep unigrams so a one-character CJK query can match a longer run.
+        // Bigrams retain useful multi-character discrimination for ordinary queries.
+        for ch in &chars {
+            tokens.insert(ch.to_string());
+        }
+        for pair in chars.windows(2) {
+            tokens.insert(pair.iter().collect());
         }
         run.clear();
     };
