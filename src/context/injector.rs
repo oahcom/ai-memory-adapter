@@ -141,7 +141,8 @@ impl<'a> ContextInjector<'a> {
         let mut chars_used = 0;
         for memory in memories {
             let line = format!("[{}] {}", memory.created_at.to_rfc3339(), memory.content);
-            let required_chars = line.chars().count() + usize::from(!text.is_empty());
+            let separator_chars = if text.is_empty() { 0 } else { 1 };
+            let required_chars = line.chars().count().saturating_add(separator_chars);
             if required_chars > self.config.max_chars.saturating_sub(chars_used) {
                 entries_omitted += 1;
                 continue;
