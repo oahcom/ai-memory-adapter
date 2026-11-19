@@ -20,6 +20,7 @@ fn memory(session_id: &str, content: &str) -> MemoryEntry {
     MemoryEntry {
         id: Uuid::new_v4(),
         session_id: session_id.into(),
+        work_item_id: None,
         content: content.into(),
         embedding: None,
         metadata: json!({"source": "context-injector-test"}),
@@ -185,4 +186,26 @@ async fn config_rejects_invalid_values() {
 
     drop(storage);
     let _ = std::fs::remove_file(path);
+#[tokio::test]
+async fn inject_work_item_retrieves_across_sessions_but_excludes_other_items() {
+    let (storage, path) = setup().await;
+    let mut a1 = memory("session-a1", "Rust work item alpha first session");
+    a1.work_item_id = Some("WI-A".into());
+    let mut a2 = memory("session-a2", "Rust work item alpha second session");
+    a2.work_item_id = Some("WI-A".into());
+    let mut b1 = memory("session-b1", "Rust work item beta private content");
+    b1.work_item_id = Some("WI-B".into());
+    storage.store(a1).await.unwrap();
+    storage.store(a2).await.unwrap();
+    storage.store(b1).await.unwrap();
+    let injector = ContextInjector::new(&storage, test_config(10, 8_000)).unwrap();
+    let result = injector.inject_work_item("WI-A", "Rust work item").await.unwrap();
+    assert_eq!(result.entries_included, 2);
+    assert!(result.text.contains("alpha first session"));
+    assert!(result.text.contains("alpha second session"));
+    assert!(!result.text.contains("beta private content"));
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+
 }
