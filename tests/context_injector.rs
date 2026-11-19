@@ -189,7 +189,7 @@ async fn config_rejects_invalid_values() {
 }
 
 #[tokio::test]
-async fn inject_work_item_retrieves_across_sessions_but_excludes_other_items {
+async fn inject_work_item_retrieves_across_sessions_but_excludes_other_items() {
     let (storage, path) = setup().await;
     let mut a1 = memory("session-a1", "Rust work item alpha first session");
     a1.work_item_id = Some("WI-A".into());
@@ -201,7 +201,10 @@ async fn inject_work_item_retrieves_across_sessions_but_excludes_other_items {
     storage.store(a2).await.unwrap();
     storage.store(b1).await.unwrap();
     let injector = ContextInjector::new(&storage, test_config(10, 8_000)).unwrap();
-    let result = injector.inject_work_item("WI-A", "Rust work item").await.unwrap();
+    let result = injector
+        .inject_work_item("WI-A", "Rust work item")
+        .await
+        .unwrap();
     assert_eq!(result.entries_included, 2);
     assert!(result.text.contains("alpha first session"));
     assert!(result.text.contains("alpha second session"));
@@ -209,4 +212,3 @@ async fn inject_work_item_retrieves_across_sessions_but_excludes_other_items {
     drop(storage);
     let _ = std::fs::remove_file(path);
 }
-
