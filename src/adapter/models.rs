@@ -30,8 +30,14 @@ impl MemoryEntry {
                 "session_id must not be empty".into(),
             ));
         }
-        if self.work_item_id.as_ref().is_some_and(|id| id.trim().is_empty()) {
-            return Err(AdapterError::Validation("work_item_id must not be empty when provided".into()));
+        if self
+            .work_item_id
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err(AdapterError::Validation(
+                "work_item_id must not be empty when provided".into(),
+            ));
         }
         if self.content.trim().is_empty() {
             return Err(AdapterError::Validation("content must not be empty".into()));
@@ -90,8 +96,14 @@ impl Query {
                 "session_id must not be empty when provided".into(),
             ));
         }
-        if self.work_item_id.as_ref().is_some_and(|id| id.trim().is_empty()) {
-            return Err(AdapterError::Validation("work_item_id must not be empty when provided".into()));
+        if self
+            .work_item_id
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err(AdapterError::Validation(
+                "work_item_id must not be empty when provided".into(),
+            ));
         }
         if self.limit == 0 {
             return Err(AdapterError::Validation(
@@ -210,5 +222,4 @@ mod tests {
         };
         assert!(matches!(query.validate(), Err(AdapterError::Validation(_))));
     }
-
 }
