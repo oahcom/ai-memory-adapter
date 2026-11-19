@@ -118,7 +118,8 @@ impl<'a> ContextInjector<'a> {
         let mut chars_used = 0;
 
         for memory in memories {
-            let escaped_content = escape_context_content(&memory.content);\n            let line = format!("[{}] {}", memory.created_at.to_rfc3339(), escaped_content);
+            let escaped_content = escape_context_content(&memory.content);
+            let line = format!("[{}] {}", memory.created_at.to_rfc3339(), escaped_content);
             let line_chars = line.chars().count();
             let separator_chars = if text.is_empty() { 0 } else { 1 };
             let required_chars = line_chars.saturating_add(separator_chars);
