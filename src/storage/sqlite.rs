@@ -485,10 +485,58 @@ fn decode_entry(row: &sqlx::sqlite::SqliteRow) -> AdapterResult<MemoryEntry> {
 }
 
 fn tokenize(text: &str) -> HashSet<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(str::to_lowercase)
-        .collect()
+    let mut tokens = HashSet::new();
+    let mut word = String::new();
+    let mut cjk_run = String::new();
+
+    let flush_word = |word: &mut String, tokens: &mut HashSet<String>| {
+        if !word.is_empty() {
+            tokens.insert(word.to_lowercase());
+            word.clear();
+        }
+    };
+    let flush_cjk = |run: &mut String, tokens: &mut HashSet<String>| {
+        if run.is_empty() {
+            return;
+        }
+        let chars: Vec<char> = run.chars().collect();
+        if chars.len() == 1 {
+            tokens.insert(chars.iter().collect());
+        } else {
+            for pair in chars.windows(2) {
+                tokens.insert(pair.iter().collect());
+            }
+        }
+        run.clear();
+    };
+
+    for ch in text.chars() {
+        if is_cjk(ch) {
+            flush_word(&mut word, &mut tokens);
+            cjk_run.push(ch);
+        } else if ch.is_alphanumeric() {
+            flush_cjk(&mut cjk_run, &mut tokens);
+            word.push(ch);
+        } else {
+            flush_word(&mut word, &mut tokens);
+            flush_cjk(&mut cjk_run, &mut tokens);
+        }
+    }
+    flush_word(&mut word, &mut tokens);
+    flush_cjk(&mut cjk_run, &mut tokens);
+    tokens
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0x3040..=0x30FF
+            | 0x31F0..=0x31FF
+            | 0xAC00..=0xD7AF
+    )
 }
 
 fn lexical_score(query_tokens: &HashSet<String>, content: &str) -> f32 {
