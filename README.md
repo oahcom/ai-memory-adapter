@@ -67,3 +67,5 @@ When both `work_item_id` and `session_id` are supplied, both filters apply.
 Existing databases are migrated with a nullable column; legacy records remain
 unscoped and are not returned by a named Work Item query. An omitted Work Item
 scope preserves the pre-existing session/global query behavior.
+
+**Rust source compatibility:** this crate is currently pre-1.0 (`0.x`). Adding public fields to `MemoryEntry` and `Query` is source-breaking for downstream code that constructs these structs with exhaustive struct literals; those callers must add `work_item_id`. Serde defaults preserve compatibility with older serialized data, not Rust source code.
