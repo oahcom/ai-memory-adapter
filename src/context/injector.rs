@@ -17,7 +17,7 @@ impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             max_entries: 10,
-            min_score: 0.25,
+            min_score: 0.34,
             max_chars: 8_000,
         }
     }
