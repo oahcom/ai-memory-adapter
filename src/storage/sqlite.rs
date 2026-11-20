@@ -198,7 +198,7 @@ fn is_sqlite_busy(error: &sqlx::Error) -> bool {
 
 fn is_sqlite_busy_code(code: Option<&str>) -> bool {
     code.and_then(|code| code.parse::<i32>().ok())
-        .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+        .is_some_and(|code| code >= 0 && matches!(code & 0xff, 5 | 6))
 }
 
 impl SqliteStorage {
@@ -856,7 +856,7 @@ mod tests {
 
     #[test]
     fn is_sqlite_busy_rejects_non_lock_and_unparseable_codes() {
-        for code in ["1", "11", "not-a-code", "", "-1"] {
+        for code in ["1", "11", "not-a-code", "", "-1", "-251", "-250"] {
             assert!(
                 !is_sqlite_busy_code(Some(code)),
                 "SQLite result code {code:?} must not be retried"
