@@ -16,3 +16,11 @@ jobs:
     - run: cargo test --verbose
     - run: cargo clippy --all-targets -- -D warnings
     - run: cargo fmt --all -- --check
+    # These regression tests carry #[ignore] because they install a global fault
+    # injection hook, so the default `cargo test` above never executes them.
+    # Each filter is a bare substring matched by Cargo; do not pair it with
+    # --exact, which would find nothing and still exit 0. Verify each step
+    # reports "1 passed" rather than "0 passed; N filtered out".
+    - run: cargo test --lib prune_rolls_back_failure_after_delete_within_batch -- --ignored --test-threads=1
+    - run: cargo test --lib initialize_schema_rolls_back_ddl_failure_after_alter -- --ignored --test-threads=1
+    - run: cargo test --lib initialize_schema_rolls_back_index_failure_after_first_index -- --ignored --test-threads=1
