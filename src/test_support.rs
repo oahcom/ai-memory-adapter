@@ -1,7 +1,9 @@
 //! Test-only support for fault injection and synchronization.
-//! Only compiled during `cargo test`, never in production builds.
+//! Only compiled during `cargo test` or with the `test-support` feature.
+#![cfg_attr(all(feature = "test-support", not(test)), allow(dead_code))]
 
 use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
 type PruneHook = Arc<dyn Fn(usize) -> Result<(), String> + Send + Sync>;
 
@@ -148,3 +150,21 @@ impl SyncBarrier {
 /// Test-only observer for query() candidate fetch count.
 pub(crate) static LAST_QUERY_CANDIDATE_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+static LAST_QUERY_CANDIDATE_IDS: Mutex<Vec<Uuid>> = Mutex::new(Vec::new());
+
+/// Record candidate ids selected by query().
+pub(crate) fn record_query_candidate_ids(ids: Vec<Uuid>) {
+    *LAST_QUERY_CANDIDATE_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = ids;
+}
+
+/// Read back the ids recorded by the most recent query().
+#[cfg(feature = "test-support")]
+pub(crate) fn last_query_candidate_ids() -> Vec<Uuid> {
+    LAST_QUERY_CANDIDATE_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}

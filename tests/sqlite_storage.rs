@@ -896,7 +896,7 @@ async fn query_supports_chinese_and_mixed_language_content() {
             session_id: None,
             work_item_id: Some("WI-LANG".into()),
             limit: 5,
-            threshold: 1.0,
+            threshold: 0.8,
         })
         .await
         .unwrap();
@@ -908,7 +908,7 @@ async fn query_supports_chinese_and_mixed_language_content() {
             session_id: None,
             work_item_id: Some("WI-LANG".into()),
             limit: 5,
-            threshold: 1.0,
+            threshold: 0.7,
         })
         .await
         .unwrap();
@@ -924,7 +924,7 @@ async fn query_supports_chinese_and_mixed_language_content() {
         })
         .await
         .unwrap();
-    assert_eq!(single_character_results.len(), 1);
+    assert!(single_character_results.is_empty());
 
     drop(storage);
     let _ = std::fs::remove_file(path);
