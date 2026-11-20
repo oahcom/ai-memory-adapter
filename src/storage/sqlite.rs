@@ -1306,6 +1306,144 @@ mod tests {
     }
 
     // --------------------------------------------------------
+    // Test 7: Transaction rollback discards uncommitted changes
+    // --------------------------------------------------------
+
+    #[tokio::test]
+    async fn waldb_transaction_rollback_discards_changes() {
+        let path = temp_db_path("wal-rollback");
+        let storage = SqliteStorage::open(&path).await.unwrap();
+
+        let session = "wal-rollback-test";
+        let committed = test_entry(session, "committed before rollback");
+        let committed_id = committed.id;
+        storage.store(committed).await.unwrap();
+
+        let rolled_back = test_entry(session, "must be discarded");
+        let rolled_back_id = rolled_back.id;
+
+        let mut tx = storage.pool.begin().await.unwrap();
+
+        let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+
+        sqlx::query(
+            "INSERT INTO memories (
+                id, session_id, content, embedding_json, metadata_json,
+                created_at, access_count, last_accessed
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(rolled_back_id.to_string())
+        .bind(session)
+        .bind("must be discarded")
+        .bind(Option::<String>::None)
+        .bind("{}")
+        .bind(&timestamp)
+        .bind(0_i64)
+        .bind(&timestamp)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        tx.rollback().await.unwrap();
+
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE id = ?")
+            .bind(rolled_back_id.to_string())
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(remaining, 0, "rolled-back insert must not persist");
+
+        let survivors: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE id = ?")
+            .bind(committed_id.to_string())
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(survivors, 1, "committed row must survive a later rollback");
+
+        drop(storage);
+        remove_db_files(&path);
+    }
+
+    // --------------------------------------------------------
+    // Test 8: Child-process helper for process-exit persistence
+    // --------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "invoked only by committed_data_survives_process_exit"]
+    async fn write_committed_data_for_process_exit_test() {
+        let Ok(db_path) = std::env::var("AI_MEMORY_PROCESS_EXIT_DB") else {
+            return;
+        };
+
+        let storage = SqliteStorage::open(std::path::PathBuf::from(db_path))
+            .await
+            .unwrap();
+
+        for content in ["first", "second", "third"] {
+            storage
+                .store(test_entry("process-exit-session", content))
+                .await
+                .unwrap();
+        }
+
+        // Explicitly close the pool before the child process exits.
+        storage.pool.close().await;
+        drop(storage);
+    }
+
+    // --------------------------------------------------------
+    // Test 9: Committed transactions survive actual process exit
+    // --------------------------------------------------------
+
+    #[tokio::test]
+    async fn committed_data_survives_process_exit() {
+        let path = temp_db_path("process-exit");
+
+        let exe = std::env::current_exe().unwrap();
+
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "storage::sqlite::tests::write_committed_data_for_process_exit_test",
+                "--ignored",
+            ])
+            .env("AI_MEMORY_PROCESS_EXIT_DB", &path)
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "child process must exit successfully");
+
+        // The child process has terminated. Reopen the same database
+        // from the parent process and verify the committed records.
+        let storage = SqliteStorage::open(&path).await.unwrap();
+
+        let contents: Vec<String> = sqlx::query_scalar(
+            "SELECT content FROM memories
+             WHERE session_id = ?
+             ORDER BY content",
+        )
+        .bind("process-exit-session")
+        .fetch_all(&storage.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            contents,
+            vec![
+                "first".to_string(),
+                "second".to_string(),
+                "third".to_string(),
+            ],
+            "all committed rows must survive child-process termination"
+        );
+
+        drop(storage);
+        remove_db_files(&path);
+    }
+
+    // --------------------------------------------------------
     // Test 6: Ignored performance benchmark
     //
     // 488 memories, one session.
@@ -1322,23 +1460,30 @@ mod tests {
         const MEMORY_COUNT: usize = 488;
         const WARMUP_COUNT: usize = 3;
         const SAMPLE_COUNT: usize = 30;
-        const MATCHING_QUERY: &str = "benchmark wal memory shared query keyword";
+
+        const MATCHING_QUERY: &str = "benchmark wal memory shared query keyword absent";
 
         let session = "wal-benchmark-session";
 
-        // (query text, query limit, threshold, expected rows written back)
+        // All tiers use identical query text and identical corpus.
         //
-        // limit must be greater than zero and threshold must be within
-        // [0.0, 1.0], so the zero-write-back tier uses a query whose terms
-        // occur in no seeded memory: lexical_score returns 0.0, below the
-        // 0.5 cutoff, and nothing is matched or written back.
-        let tiers = [
-            ("absent unmatched term", 10usize, 0.5f32, 0usize),
-            (MATCHING_QUERY, 1, 0.0, 1),
-            (MATCHING_QUERY, 10, 0.0, 10),
-        ];
+        // Query tokens:
+        // benchmark, wal, memory, shared, query, keyword, absent
+        //
+        // Each seeded memory contains the first six tokens, producing
+        // a lexical score of 6/7 = 0.857.
+        //
+        // threshold=0.9 rejects all results.
+        // threshold=0.8 accepts all results.
+        //
+        // Only limit and threshold differ between tiers.
+        // Query tokenization and candidate scoring therefore operate
+        // on the same query and corpus in all three tiers.
+        //
+        // (query limit, threshold, expected rows written back)
+        let tiers = [(10usize, 0.9f32, 0usize), (1, 0.8, 1), (10, 0.8, 10)];
 
-        for (query_text, query_limit, threshold, expected_rows) in tiers {
+        for (query_limit, threshold, expected_rows) in tiers {
             let path = temp_db_path(&format!("benchmark-{}", expected_rows));
 
             // Each measurement tier receives a fresh independent database.
@@ -1346,13 +1491,16 @@ mod tests {
 
             // Seed 488 records in the same session.
             for i in 0..MEMORY_COUNT {
-                let entry = test_entry(session, &format!("{} item {}", MATCHING_QUERY, i));
+                let entry = test_entry(
+                    session,
+                    &format!("benchmark wal memory shared query keyword item {}", i),
+                );
 
                 storage.store(entry).await.unwrap();
             }
 
             let query = Query {
-                text: query_text.into(),
+                text: MATCHING_QUERY.into(),
                 session_id: Some(session.into()),
                 limit: query_limit,
                 threshold,
@@ -1394,7 +1542,6 @@ mod tests {
             let rank = (SAMPLE_COUNT * 50).div_ceil(100);
             let p50 = samples[rank - 1];
 
-            // Required output format.
             println!("rows={} p50={}us", expected_rows, p50);
 
             drop(storage);
