@@ -4,7 +4,7 @@ use std::{collections::HashSet, path::Path, time::Duration};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous},
     Row, SqlitePool,
 };
 use uuid::Uuid;
@@ -25,6 +25,11 @@ pub const MAX_QUERY_CANDIDATES: usize = 1000;
 /// Number of records processed per batch in Ebbinghaus pruning.
 /// Each batch runs in its own short transaction to avoid long-running locks.
 pub const PRUNE_BATCH_SIZE: usize = 256;
+
+/// Bound retries for DELETE-to-WAL conversion when another process briefly
+/// owns a SQLite lock. The connection's busy_timeout remains enabled too.
+const WAL_MODE_RETRY_WINDOW: Duration = Duration::from_secs(5);
+const WAL_MODE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct SqliteStorage {
     pool: SqlitePool,
@@ -136,7 +141,11 @@ async fn initialize_schema(pool: &SqlitePool) -> AdapterResult<()> {
                 .execute(&mut *connection)
                 .await
                 .map_err(storage_error)?;
-            Ok(())
+            // SQLite cannot change journal_mode while a transaction is active.
+            // Do this on the same connection immediately after the serialized
+            // migration transaction commits. Concurrent first-openers may race
+            // here, so retry SQLITE_BUSY/SQLITE_LOCKED for a bounded interval.
+            enable_wal_with_retry(&mut connection).await
         }
         Err(error) => {
             let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
@@ -145,11 +154,51 @@ async fn initialize_schema(pool: &SqlitePool) -> AdapterResult<()> {
     }
 }
 
+async fn enable_wal_with_retry(
+    connection: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+) -> AdapterResult<()> {
+    let started = tokio::time::Instant::now();
+    loop {
+        match sqlx::query_scalar::<_, String>("PRAGMA journal_mode=WAL")
+            .fetch_one(&mut **connection)
+            .await
+        {
+            Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
+            Ok(mode) => {
+                let elapsed = started.elapsed();
+                if elapsed >= WAL_MODE_RETRY_WINDOW {
+                    return Err(AdapterError::Storage(format!(
+                        "SQLite did not enter WAL journal mode within the retry window (reported mode: {mode})"
+                    )));
+                }
+                tokio::time::sleep(WAL_MODE_RETRY_INTERVAL.min(WAL_MODE_RETRY_WINDOW - elapsed))
+                    .await;
+            }
+            Err(error) if is_sqlite_busy(&error) => {
+                let elapsed = started.elapsed();
+                if elapsed >= WAL_MODE_RETRY_WINDOW {
+                    return Err(storage_error(error));
+                }
+                tokio::time::sleep(WAL_MODE_RETRY_INTERVAL.min(WAL_MODE_RETRY_WINDOW - elapsed))
+                    .await;
+            }
+            Err(error) => return Err(storage_error(error)),
+        }
+    }
+}
+
+fn is_sqlite_busy(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|database_error| database_error.code())
+        .is_some_and(|code| matches!(code.as_ref(), "5" | "6"))
+}
+
 impl SqliteStorage {
     /// Opens a SQLite-backed memory store.
     ///
-    /// WAL journal mode and NORMAL synchronous mode are explicitly configured
-    /// to avoid depending on sqlx defaults.
+    /// WAL journal mode is enabled after the serialized schema migration;
+    /// NORMAL synchronous mode is explicitly configured on each connection.
     ///
     /// Persistence contract:
     ///
@@ -173,8 +222,8 @@ impl SqliteStorage {
     ///
     /// Explicit configuration is intentional: the previous implementation
     /// relied on sqlx defaults, which left journal_mode at DELETE and
-    /// synchronous at FULL. Each retrieval therefore incurred a rollback-
-    /// journal full synchronization during its access-statistics transaction.
+    /// synchronous at FULL. WAL conversion is serialized with first-open
+    /// migration and retried for transient cross-process lock contention.
     /// Explicit settings prevent future third-party default changes from
     /// silently restoring that performance behavior.
     pub async fn open(path: impl AsRef<Path>) -> AdapterResult<Self> {
@@ -183,7 +232,6 @@ impl SqliteStorage {
             .create_if_missing(true)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(5))
-            .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal);
 
         let pool = SqlitePoolOptions::new()
