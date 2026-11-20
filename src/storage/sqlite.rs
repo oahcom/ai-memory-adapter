@@ -188,10 +188,17 @@ async fn enable_wal_with_retry(
 }
 
 fn is_sqlite_busy(error: &sqlx::Error) -> bool {
-    error
-        .as_database_error()
-        .and_then(|database_error| database_error.code())
-        .is_some_and(|code| matches!(code.as_ref(), "5" | "6"))
+    is_sqlite_busy_code(
+        error
+            .as_database_error()
+            .and_then(|database_error| database_error.code())
+            .as_deref(),
+    )
+}
+
+fn is_sqlite_busy_code(code: Option<&str>) -> bool {
+    code.and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| matches!(code & 0xff, 5 | 6))
 }
 
 impl SqliteStorage {
@@ -836,6 +843,27 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use uuid::Uuid;
+
+    #[test]
+    fn is_sqlite_busy_recognizes_primary_and_extended_lock_codes() {
+        for code in ["5", "6", "517", "262"] {
+            assert!(
+                is_sqlite_busy_code(Some(code)),
+                "SQLite lock result code {code} must be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn is_sqlite_busy_rejects_non_lock_and_unparseable_codes() {
+        for code in ["1", "11", "not-a-code", "", "-1"] {
+            assert!(
+                !is_sqlite_busy_code(Some(code)),
+                "SQLite result code {code:?} must not be retried"
+            );
+        }
+        assert!(!is_sqlite_busy_code(None));
+    }
 
     fn test_entry(session: &str, content: &str) -> MemoryEntry {
         use chrono::Utc;
