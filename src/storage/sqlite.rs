@@ -986,17 +986,26 @@ mod tests {
     async fn initialize_schema_rolls_back_ddl_failure_after_alter() {
         let path =
             std::env::temp_dir().join(format!("unit-test-schema-rollback-{}.db", Uuid::new_v4()));
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         let legacy_rows = vec![
             (
                 Uuid::from_u128(0x1001).to_string(),
                 "legacy-session-a".to_string(),
                 "legacy migration row alpha".to_string(),
+                None,
+                r#"{"source":"legacy-a"}"#.to_string(),
+                "2024-01-01T00:00:00.000000000Z".to_string(),
+                3_i32,
+                "2024-03-03T00:00:00.000000000Z".to_string(),
             ),
             (
                 Uuid::from_u128(0x1002).to_string(),
                 "legacy-session-b".to_string(),
                 "legacy migration row beta".to_string(),
+                Some("[0.125,-0.5,0.75]".to_string()),
+                r#"{"source":"legacy-b","rev":2}"#.to_string(),
+                "2024-02-02T00:00:00.000000000Z".to_string(),
+                7_i32,
+                "2024-04-04T00:00:00.000000000Z".to_string(),
             ),
         ];
 
@@ -1024,17 +1033,22 @@ mod tests {
         .execute(&legacy_pool)
         .await
         .unwrap();
-        for (id, session, content) in &legacy_rows {
+        for (id, session, content, embedding, metadata, created_at, access_count, last_accessed) in
+            &legacy_rows
+        {
             sqlx::query(
                 "INSERT INTO memories
                  (id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed)
-                 VALUES (?, ?, ?, NULL, '{}', ?, 3, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(id)
             .bind(session)
             .bind(content)
-            .bind(&now)
-            .bind(&now)
+            .bind(embedding)
+            .bind(metadata)
+            .bind(created_at)
+            .bind(access_count)
+            .bind(last_accessed)
             .execute(&legacy_pool)
             .await
             .unwrap();
@@ -1113,22 +1127,23 @@ mod tests {
                         row.get::<String, _>("id"),
                         row.get::<String, _>("session_id"),
                         row.get::<String, _>("content"),
+                        row.get::<Option<String>, _>("embedding_json"),
+                        row.get::<String, _>("metadata_json"),
+                        row.get::<String, _>("created_at"),
                         row.get::<i32, _>("access_count"),
+                        row.get::<String, _>("last_accessed"),
                     )
                 })
                 .collect::<Vec<_>>()
         };
         let before_retry =
-            sqlx::query("SELECT id, session_id, content, access_count FROM memories ORDER BY id")
+            sqlx::query("SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories ORDER BY id")
                 .fetch_all(&inspect_pool)
                 .await
                 .unwrap();
         assert_eq!(
             read_legacy_rows(before_retry),
-            legacy_rows
-                .iter()
-                .map(|(id, session, content)| (id.clone(), session.clone(), content.clone(), 3))
-                .collect::<Vec<_>>(),
+            legacy_rows,
             "all legacy rows and values must survive failed migration"
         );
         inspect_pool.close().await;
@@ -1179,16 +1194,13 @@ mod tests {
         }
 
         let migrated_rows =
-            sqlx::query("SELECT id, session_id, content, access_count FROM memories ORDER BY id")
+            sqlx::query("SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories ORDER BY id")
                 .fetch_all(storage.pool())
                 .await
                 .unwrap();
         assert_eq!(
             read_legacy_rows(migrated_rows),
-            legacy_rows
-                .iter()
-                .map(|(id, session, content)| (id.clone(), session.clone(), content.clone(), 3))
-                .collect::<Vec<_>>(),
+            legacy_rows,
             "all legacy rows must remain intact after retry"
         );
 
@@ -1222,19 +1234,26 @@ mod tests {
     async fn initialize_schema_rolls_back_index_failure_after_first_index() {
         let path =
             std::env::temp_dir().join(format!("unit-test-index-rollback-{}.db", Uuid::new_v4()));
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         let legacy_rows = vec![
             (
                 Uuid::from_u128(0x2001).to_string(),
                 "index-session-a".to_string(),
                 "legacy index row alpha".to_string(),
+                None,
+                r#"{"source":"legacy-a"}"#.to_string(),
+                "2024-05-05T00:00:00.000000000Z".to_string(),
                 3_i32,
+                "2024-07-07T00:00:00.000000000Z".to_string(),
             ),
             (
                 Uuid::from_u128(0x2002).to_string(),
                 "index-session-b".to_string(),
                 "legacy index row beta".to_string(),
+                Some("[0.125,-0.5,0.75]".to_string()),
+                r#"{"source":"legacy-b","rev":2}"#.to_string(),
+                "2024-06-06T00:00:00.000000000Z".to_string(),
                 7_i32,
+                "2024-08-08T00:00:00.000000000Z".to_string(),
             ),
         ];
 
@@ -1262,18 +1281,22 @@ mod tests {
         .execute(&legacy_pool)
         .await
         .unwrap();
-        for (id, session, content, access_count) in &legacy_rows {
+        for (id, session, content, embedding, metadata, created_at, access_count, last_accessed) in
+            &legacy_rows
+        {
             sqlx::query(
                 "INSERT INTO memories
                  (id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed)
-                 VALUES (?, ?, ?, NULL, '{}', ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(id)
             .bind(session)
             .bind(content)
-            .bind(&now)
+            .bind(embedding)
+            .bind(metadata)
+            .bind(created_at)
             .bind(access_count)
-            .bind(&now)
+            .bind(last_accessed)
             .execute(&legacy_pool)
             .await
             .unwrap();
@@ -1343,14 +1366,18 @@ mod tests {
                         row.get::<String, _>("id"),
                         row.get::<String, _>("session_id"),
                         row.get::<String, _>("content"),
+                        row.get::<Option<String>, _>("embedding_json"),
+                        row.get::<String, _>("metadata_json"),
+                        row.get::<String, _>("created_at"),
                         row.get::<i32, _>("access_count"),
+                        row.get::<String, _>("last_accessed"),
                     )
                 })
                 .collect::<Vec<_>>()
         };
         let expected_legacy_rows = legacy_rows.clone();
         let before_retry =
-            sqlx::query("SELECT id, session_id, content, access_count FROM memories ORDER BY id")
+            sqlx::query("SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories ORDER BY id")
                 .fetch_all(&inspect_pool)
                 .await
                 .unwrap();
@@ -1387,7 +1414,7 @@ mod tests {
             );
         }
         let after_retry =
-            sqlx::query("SELECT id, session_id, content, access_count FROM memories ORDER BY id")
+            sqlx::query("SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories ORDER BY id")
                 .fetch_all(storage.pool())
                 .await
                 .unwrap();
