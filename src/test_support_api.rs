@@ -5,7 +5,6 @@
 
 #![cfg(feature = "test-support")]
 
-
 use uuid::Uuid;
 
 /// Returns the candidate ids that the most recent `SqliteStorage::query()` call

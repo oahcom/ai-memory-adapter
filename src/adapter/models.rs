@@ -12,6 +12,9 @@ use super::error::{AdapterError, AdapterResult};
 pub struct MemoryEntry {
     pub id: Uuid,
     pub session_id: String,
+    /// Optional stable work-item scope shared by related sessions.
+    #[serde(default)]
+    pub work_item_id: Option<String>,
     pub content: String,
     pub embedding: Option<Vec<f32>>,
     pub metadata: Value,
@@ -26,6 +29,15 @@ impl MemoryEntry {
         if self.session_id.trim().is_empty() {
             return Err(AdapterError::Validation(
                 "session_id must not be empty".into(),
+            ));
+        }
+        if self
+            .work_item_id
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err(AdapterError::Validation(
+                "work_item_id must not be empty when provided".into(),
             ));
         }
         if self.content.trim().is_empty() {
@@ -62,6 +74,9 @@ impl MemoryEntry {
 pub struct Query {
     pub text: String,
     pub session_id: Option<String>,
+    /// Restrict retrieval to one work item across any matching sessions.
+    #[serde(default)]
+    pub work_item_id: Option<String>,
     pub limit: usize,
     pub threshold: f32,
 }
@@ -81,6 +96,15 @@ impl Query {
         {
             return Err(AdapterError::Validation(
                 "session_id must not be empty when provided".into(),
+            ));
+        }
+        if self
+            .work_item_id
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err(AdapterError::Validation(
+                "work_item_id must not be empty when provided".into(),
             ));
         }
         if self.limit == 0 {
@@ -107,6 +131,7 @@ mod tests {
         MemoryEntry {
             id: Uuid::new_v4(),
             session_id: "session-001".into(),
+            work_item_id: Some("work-item-001".into()),
             content: "Rust memory adapter".into(),
             embedding: Some(vec![0.1, 0.2, 0.3]),
             metadata: json!({"source": "test"}),
@@ -154,6 +179,7 @@ mod tests {
         let query = Query {
             text: "Rust".into(),
             session_id: Some("session-001".into()),
+            work_item_id: None,
             limit: 10,
             threshold: 0.75,
         };
@@ -165,6 +191,7 @@ mod tests {
         let query = Query {
             text: "Rust".into(),
             session_id: None,
+            work_item_id: None,
             limit: 0,
             threshold: 0.5,
         };
@@ -176,9 +203,51 @@ mod tests {
         let query = Query {
             text: "Rust".into(),
             session_id: None,
+            work_item_id: None,
             limit: 10,
             threshold: f32::NAN,
         };
         assert!(query.validate().is_err());
+    }
+    #[test]
+    fn empty_work_item_id_is_rejected_for_entries_and_queries() {
+        let mut entry = sample_entry();
+        entry.work_item_id = Some("  ".into());
+        assert!(matches!(entry.validate(), Err(AdapterError::Validation(_))));
+
+        let query = Query {
+            text: "Rust".into(),
+            session_id: None,
+            work_item_id: Some("  ".into()),
+            limit: 5,
+            threshold: 0.5,
+        };
+        assert!(matches!(query.validate(), Err(AdapterError::Validation(_))));
+    }
+
+    #[test]
+    fn legacy_serialized_entries_and_queries_default_work_item_scope_to_none() {
+        let now = Utc::now();
+        let legacy_entry = json!({
+            "id": Uuid::new_v4(),
+            "session_id": "legacy-session",
+            "content": "legacy content",
+            "embedding": null,
+            "metadata": {},
+            "created_at": now,
+            "access_count": 0,
+            "last_accessed": now
+        });
+        let entry: MemoryEntry = serde_json::from_value(legacy_entry).unwrap();
+        assert_eq!(entry.work_item_id, None);
+
+        let legacy_query = json!({
+            "text": "legacy query",
+            "session_id": "legacy-session",
+            "limit": 5,
+            "threshold": 0.5
+        });
+        let query: Query = serde_json::from_value(legacy_query).unwrap();
+        assert_eq!(query.work_item_id, None);
     }
 }

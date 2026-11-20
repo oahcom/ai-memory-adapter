@@ -24,6 +24,7 @@ fn entry(session_id: &str, content: &str) -> MemoryEntry {
     MemoryEntry {
         id: Uuid::new_v4(),
         session_id: session_id.into(),
+        work_item_id: None,
         content: content.into(),
         embedding: None,
         metadata: json!({"source": "chinese-retrieval-test"}),
@@ -48,6 +49,7 @@ async fn search(storage: &SqliteStorage, text: &str) -> Vec<MemoryEntry> {
         .query(&Query {
             text: text.into(),
             session_id: None,
+            work_item_id: None,
             limit: 20,
             threshold: 0.34,
         })
@@ -96,9 +98,7 @@ async fn chinese_multi_char_partial() {
     let results = search(&storage, "机器学").await;
 
     assert!(
-        results
-            .iter()
-            .any(|e| e.content == "机器学习是人工智能"),
+        results.iter().any(|e| e.content == "机器学习是人工智能"),
         "multi-character partial Chinese queries must match longer phrases"
     );
 
@@ -111,10 +111,7 @@ async fn chinese_english_mixed() {
     let (storage, path) = setup("mixed-language").await;
 
     storage
-        .store(entry(
-            "session-mixed",
-            "Rust 的所有权系统保证内存安全",
-        ))
+        .store(entry("session-mixed", "Rust 的所有权系统保证内存安全"))
         .await
         .unwrap();
 
@@ -193,11 +190,7 @@ async fn mixed_query_requires_chinese_concept_overlap() {
 async fn chinese_punctuation_variants() {
     let (storage, path) = setup("punctuation").await;
 
-    let contents = [
-        "设计完成，开发中",
-        "设计完成, 开发中",
-        "设计完成",
-    ];
+    let contents = ["设计完成，开发中", "设计完成, 开发中", "设计完成"];
 
     for content in contents {
         storage
@@ -206,11 +199,7 @@ async fn chinese_punctuation_variants() {
             .unwrap();
     }
 
-    for query in [
-        "设计完成，开发中",
-        "设计完成, 开发中",
-        "设计完成",
-    ] {
+    for query in ["设计完成，开发中", "设计完成, 开发中", "设计完成"] {
         let results = search(&storage, query).await;
 
         assert!(
@@ -272,11 +261,9 @@ async fn english_baseline() {
 
     assert!(results.iter().any(|e| e.content == "quick brown fox"));
 
-    assert!(
-        results
-            .iter()
-            .any(|e| e.content == "THE FOX jumps over the fence")
-    );
+    assert!(results
+        .iter()
+        .any(|e| e.content == "THE FOX jumps over the fence"));
 
     assert!(
         !results.iter().any(|e| e.content.contains("foxes")),
@@ -292,17 +279,13 @@ async fn english_baseline() {
 
     assert_eq!(uppercase_results.len(), 2);
 
-    assert!(
-        uppercase_results
-            .iter()
-            .any(|e| e.content == "quick brown fox")
-    );
+    assert!(uppercase_results
+        .iter()
+        .any(|e| e.content == "quick brown fox"));
 
-    assert!(
-        uppercase_results
-            .iter()
-            .any(|e| e.content == "THE FOX jumps over the fence")
-    );
+    assert!(uppercase_results
+        .iter()
+        .any(|e| e.content == "THE FOX jumps over the fence"));
 
     let unrelated_results = search(&storage, "elephant").await;
 

@@ -106,6 +106,7 @@ fn make_entry(
     MemoryEntry {
         id,
         session_id: SESSION_ID.to_string(),
+        work_item_id: None,
         content,
         embedding: None,
         metadata: json!({
@@ -343,6 +344,7 @@ async fn measure_recency_candidate_selection_bias() {
         let query = Query {
             text: truth.query_text.to_string(),
             session_id: Some(SESSION_ID.to_string()),
+            work_item_id: None,
             limit: QUERY_LIMIT,
             threshold: THRESHOLD,
         };
@@ -734,6 +736,7 @@ async fn measure_layered_candidate_quota_sensitivity() {
         let query = Query {
             text: truth.query_text.to_string(),
             session_id: Some(SESSION_ID.to_string()),
+            work_item_id: None,
             limit: QUERY_LIMIT,
             threshold: THRESHOLD,
         };
@@ -944,6 +947,7 @@ async fn store_chinese_entry(storage: &SqliteStorage, session: &str, content: &s
         .store(MemoryEntry {
             id: Uuid::new_v4(),
             session_id: session.to_string(),
+            work_item_id: None,
             content: content.to_string(),
             embedding: None,
             metadata: json!({"source": "chinese-retrieval-test"}),
@@ -960,6 +964,7 @@ async fn chinese_search(storage: &SqliteStorage, text: &str, threshold: f32) -> 
         .query(&Query {
             text: text.to_string(),
             session_id: None,
+            work_item_id: None,
             limit: 20,
             threshold,
         })
@@ -1301,6 +1306,7 @@ async fn measure_threshold(dataset: &Dataset, threshold: Option<f32>, label: &st
         let query = Query {
             text: truth.query_text.to_string(),
             session_id: Some(SESSION_ID.to_string()),
+            work_item_id: None,
             limit: QUERY_LIMIT,
             threshold: effective_threshold,
         };
