@@ -16,11 +16,87 @@ jobs:
     - run: cargo test --verbose
     - run: cargo clippy --all-targets -- -D warnings
     - run: cargo fmt --all -- --check
-    # These regression tests carry #[ignore] because they install a global fault
-    # injection hook, so the default `cargo test` above never executes them.
-    # Each filter is a bare substring matched by Cargo; do not pair it with
-    # --exact, which would find nothing and still exit 0. Verify each step
-    # reports "1 passed" rather than "0 passed; N filtered out".
-    - run: cargo test --lib prune_rolls_back_failure_after_delete_within_batch -- --ignored --test-threads=1
-    - run: cargo test --lib initialize_schema_rolls_back_ddl_failure_after_alter -- --ignored --test-threads=1
-    - run: cargo test --lib initialize_schema_rolls_back_index_failure_after_first_index -- --ignored --test-threads=1
+    # These regression tests install a global fault-injection hook and are
+    # intentionally run one at a time. Parse the stable libtest summary rather
+    # than trusting Cargo's exit code alone: a zero-match filter exits 0.
+    - name: Run ignored SQLite rollback tests
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        run_ignored_test() {
+          local filter="$1"
+          local output rc summary passed failed ignored actual
+
+          # Capture Cargo's output and exact exit status without set -e
+          # terminating the command substitution assignment.
+          set +e
+          output="$(cargo test --lib "$filter" -- --ignored --test-threads=1 2>&1)"
+          rc=$?
+          set -e
+
+          printf '%s\n' "$output"
+
+          summary="$(
+            printf '%s\n' "$output" |
+              sed -E 's/\033\[[0-9;]*[[:alpha:]]//g' |
+              awk '
+                /^test result: / {
+                  count++
+                  if (NF < 9 ||
+                      $1 != "test" || $2 != "result:" ||
+                      ($3 != "ok." && $3 != "FAILED.") ||
+                      $4 !~ /^[0-9]+$/ || $5 != "passed;" ||
+                      $6 !~ /^[0-9]+$/ || $7 != "failed;" ||
+                      $8 !~ /^[0-9]+$/ || $9 != "ignored;") {
+                    invalid = 1
+                    next
+                  }
+                  passed = $4
+                  failed = $6
+                  ignored = $8
+                }
+                END {
+                  if (count == 1 && !invalid)
+                    printf "%s %s %s\n", passed, failed, ignored
+                }
+              '
+          )"
+
+          if [[ -z "$summary" ]]; then
+            printf 'ERROR: %s expected=1 actual=unparsed cargo_exit=%s (missing or malformed test result line)\n' "$filter" "$rc" >&2
+            if (( rc != 0 )); then
+              return "$rc"
+            fi
+            return 1
+          fi
+
+          read -r passed failed ignored <<<"$summary"
+          actual=$((passed + failed + ignored))
+          printf 'CHECK: %s expected=1 actual=%s passed=%s failed=%s ignored=%s cargo_exit=%s\n' \
+            "$filter" "$actual" "$passed" "$failed" "$ignored" "$rc"
+
+          if (( rc != 0 )); then
+            printf 'ERROR: %s cargo exited nonzero (cargo_exit=%s)\n' "$filter" "$rc" >&2
+            return "$rc"
+          fi
+          if (( actual != 1 || passed != 1 || failed != 0 || ignored != 0 )); then
+            printf 'ERROR: %s expected exactly one passed test and zero failed/ignored tests\n' "$filter" >&2
+            return 1
+          fi
+        }
+
+        overall_rc=0
+        run_ignored_test "storage::sqlite::tests::prune_rolls_back_failure_after_delete_within_batch" || {
+          rc=$?
+          if (( overall_rc == 0 )); then overall_rc=$rc; fi
+        }
+        run_ignored_test "storage::sqlite::tests::initialize_schema_rolls_back_ddl_failure_after_alter" || {
+          rc=$?
+          if (( overall_rc == 0 )); then overall_rc=$rc; fi
+        }
+        run_ignored_test "storage::sqlite::tests::initialize_schema_rolls_back_index_failure_after_first_index" || {
+          rc=$?
+          if (( overall_rc == 0 )); then overall_rc=$rc; fi
+        }
+        exit "$overall_rc"
