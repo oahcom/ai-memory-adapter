@@ -73,6 +73,56 @@ Issue（需求+状态）
 - Review 绑定实际审查版本；PR 更新后确认审查是否仍适用
 - 不因 PR 创建关闭需求；不因提交认定验收；不因测试通过认定生产可用
 
+**Rebase / squash 变更清单核对：**
+
+rebase 和 squash 后，必须核对原 PR 变更是否完整保留。无冲突不代表已纳入目标分支。
+
+- rebase 完成后，对比原 PR head 与 rebase 后 head 的变更文件清单。分别列出原 PR 相对原目标分支的文件集，以及 rebase 后相对新目标分支的文件集，并检查双方差集：
+
+  ```bash
+  git diff --name-only "$ORIGINAL_BASE...$ORIGINAL_PR_HEAD" | LC_ALL=C sort -u
+  git diff --name-only "$TARGET_BASE..$REBASED_HEAD" | LC_ALL=C sort -u
+
+  # 原 PR 有、rebase 后没有
+  comm -23 \
+    <(git diff --name-only "$ORIGINAL_BASE...$ORIGINAL_PR_HEAD" | LC_ALL=C sort -u) \
+    <(git diff --name-only "$TARGET_BASE..$REBASED_HEAD" | LC_ALL=C sort -u)
+
+  # rebase 后新增、原 PR 没有
+  comm -13 \
+    <(git diff --name-only "$ORIGINAL_BASE...$ORIGINAL_PR_HEAD" | LC_ALL=C sort -u) \
+    <(git diff --name-only "$TARGET_BASE..$REBASED_HEAD" | LC_ALL=C sort -u)
+  ```
+
+- 对原 PR 的每个 commit，逐一核对其变更是否已由目标分支包含，或由 rebase 后的提交等价保留。列出原 PR commit，并使用 `git cherry` 和 `git range-diff` 辅助比对：
+
+  ```bash
+  git log --reverse --format='%H' "$ORIGINAL_BASE..$ORIGINAL_PR_HEAD"
+  git cherry -v "$TARGET_BASE" "$ORIGINAL_PR_HEAD"
+  git range-diff \
+    "$ORIGINAL_BASE..$ORIGINAL_PR_HEAD" \
+    "$TARGET_BASE..$REBASED_HEAD"
+  ```
+
+  对每个原始 commit 检查其实际 diff 和对应保留结果。工具标记或 patch-id 相同只能作为比对线索，不能替代对变更内容和行为的核验。
+
+- 对纯 CI、文档、配置等与产品代码无冲突的提交，单独记录是否保留及其依据。不能以「无冲突」推定「已纳入」，也不能因产品代码变更已 rebase 就推定这些独立文件变更一并保留。
+
+- squash 前，对比最终 diff 文件清单与预期变更清单：
+
+  ```bash
+  git diff --name-status "$TARGET_BASE..$SQUASH_HEAD"
+  git diff --name-only "$TARGET_BASE..$SQUASH_HEAD" -- .github/workflows/ci.yml
+  ```
+
+  第二条命令用于检查指定文件是否出现在最终 diff 中；无输出表示该文件没有相对目标分支形成最终差异。对原 PR 中存在、但未出现在最终 diff 的文件，必须检查目标分支与 squash head 中的实际文件内容，并明确归类为：变更已存在于 base、经确认有意舍弃，或意外丢失。不得仅凭文件路径相同或文件清单相同认定语义等价。
+
+- 将原 PR 文件集、rebase 后文件集、差集、逐 commit 核对结果、最终 squash diff 清单及未保留文件的归类写入合并证据记录。差集中的每个文件必须逐项给出处置结果：保留、已存在于 base、经确认有意舍弃，或意外丢失，并附对应 diff 或内容核验依据。核对证据不完整时，状态保持阻塞，不得进入合并裁决。
+
+本规则来自 `eb43519` 的实际遗漏：该提交只修改 `.github/workflows/ci.yml`，包含三个需要 `--ignored --test-threads=1` 串行执行的 SQLite 回滚测试 CI 覆盖。它是 PR 分支祖先，但不是 main 的祖先。rebase 到 `02e40d2` 时，该文件与 main 无冲突，却没有被带入 rebase 后的变更；squash `1e55508` 沿用了丢失后的文件树，后续 `83610a9` 也未恢复该覆盖。squash 消息列出的 12 个文件中没有 `.github/workflows/ci.yml`，这一证据当时已经存在，却未被核对。该缺陷最终由 `c7f7d57` 修复。
+
+这项检查是防止静默丢弃的流程门禁，不要求改变产品代码。文件清单用于发现遗漏，不构成语义等价证明。
+
 ## 5. 跨会话任务交接
 
 工作单元设计为**自包含**：接收方不依赖当前对话上下文。
@@ -113,3 +163,4 @@ Issue（需求+状态）
 | 日期 | 变更 | Commit |
 |---|---|---|
 | 2026-11-20 | 首版文档创建 | — |
+| 2026-11-20 | 增加 rebase / squash 变更清单核对门禁 | — |
