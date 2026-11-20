@@ -202,12 +202,12 @@ impl SqliteStorage {
                 Err(error) => {
                     // SQLite extended result codes keep the primary code in the
                     // low byte, so this also covers SQLITE_BUSY_RECOVERY and
-                    // SQLITE_BUSY_SNAPSHOT.
+                    // SQLITE_BUSY_SNAPSHOT. Negative values are not result codes
+                    // and must not be masked into a match.
                     let is_sqlite_busy = match &error {
-                        sqlx::Error::Database(db_error) => db_error
-                            .code()
-                            .and_then(|code| code.parse::<i32>().ok())
-                            .is_some_and(|code| code & 0xff == 5),
+                        sqlx::Error::Database(db_error) => {
+                            is_sqlite_busy_code(db_error.code().as_deref())
+                        }
                         _ => false,
                     };
 
@@ -809,6 +809,18 @@ fn lexical_score(query_tokens: &HashSet<String>, content: &str) -> f32 {
     matched as f32 / effective_tokens.len() as f32
 }
 
+/// Returns whether a SQLite result code means the primary `SQLITE_BUSY` error,
+/// including its extended variants.
+///
+/// Only the primary code in the low byte is inspected, so
+/// `SQLITE_BUSY_RECOVERY` (261) and `SQLITE_BUSY_SNAPSHOT` (517) match while
+/// `SQLITE_LOCKED` and its variants do not. Negative values are not result
+/// codes: masking them would turn `-251` into `5` and retry a non-BUSY error.
+fn is_sqlite_busy_code(code: Option<&str>) -> bool {
+    code.and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| code >= 0 && code & 0xff == 5)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -819,6 +831,38 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use uuid::Uuid;
+
+    #[test]
+    fn is_sqlite_busy_code_accepts_primary_and_extended_busy() {
+        for code in ["5", "261", "517"] {
+            assert!(
+                is_sqlite_busy_code(Some(code)),
+                "SQLite BUSY result code {code} must be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn is_sqlite_busy_code_rejects_negative_garbage_and_locked() {
+        // -251 masks to 5 and -250 to 6 under `& 0xff`; neither is a result code.
+        for code in [
+            "-1",
+            "-251",
+            "-250",
+            "6",
+            "262",
+            "1",
+            "11",
+            "not-a-code",
+            "",
+        ] {
+            assert!(
+                !is_sqlite_busy_code(Some(code)),
+                "SQLite result code {code:?} must not be retried"
+            );
+        }
+        assert!(!is_sqlite_busy_code(None));
+    }
 
     fn test_entry(session: &str, content: &str) -> MemoryEntry {
         use chrono::Utc;
