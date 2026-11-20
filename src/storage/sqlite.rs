@@ -198,7 +198,7 @@ fn is_sqlite_busy(error: &sqlx::Error) -> bool {
 
 fn is_sqlite_busy_code(code: Option<&str>) -> bool {
     code.and_then(|code| code.parse::<i32>().ok())
-        .is_some_and(|code| code >= 0 && matches!(code & 0xff, 5 | 6))
+        .is_some_and(|code| code >= 0 && code & 0xff == 5)
 }
 
 impl SqliteStorage {
@@ -845,24 +845,130 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn is_sqlite_busy_recognizes_primary_and_extended_lock_codes() {
-        for code in ["5", "6", "517", "262"] {
+    fn is_sqlite_busy_code_recognizes_busy_family() {
+        // SQLITE_BUSY and extended SQLITE_BUSY result codes.
+        let accepted = [
+            "5",    // SQLITE_BUSY
+            "261",  // SQLITE_BUSY_RECOVERY
+            "517",  // SQLITE_BUSY_SNAPSHOT
+            "773",  // SQLITE_BUSY_TIMEOUT
+            "1029", // low byte 0x05: proves low-byte semantics, not a code whitelist
+        ];
+
+        for code in accepted {
             assert!(
                 is_sqlite_busy_code(Some(code)),
-                "SQLite lock result code {code} must be retried"
+                "expected SQLite BUSY code {code} to be recognized"
             );
+        }
+
+        // SQLITE_LOCKED and other non-BUSY codes.
+        let rejected = [
+            "-1",
+            "-251",
+            "-250",
+            "6",
+            "262",
+            "1",
+            "11",
+            "not-a-code",
+            "",
+            "-6",
+            "-262",
+        ];
+
+        for code in rejected {
+            assert!(
+                !is_sqlite_busy_code(Some(code)),
+                "expected SQLite code {code} to be rejected"
+            );
+        }
+
+        assert!(!is_sqlite_busy_code(None));
+    }
+
+    #[derive(Debug)]
+    struct InjectedDatabaseError {
+        code: String,
+    }
+
+    impl InjectedDatabaseError {
+        fn new(code: &str) -> Self {
+            Self {
+                code: code.to_owned(),
+            }
+        }
+    }
+
+    impl std::fmt::Display for InjectedDatabaseError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "injected SQLite error code: {}", self.code)
+        }
+    }
+
+    impl std::error::Error for InjectedDatabaseError {}
+
+    impl sqlx::error::DatabaseError for InjectedDatabaseError {
+        fn message(&self) -> &str {
+            "injected SQLite database error"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(&self.code))
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
         }
     }
 
     #[test]
-    fn is_sqlite_busy_rejects_non_lock_and_unparseable_codes() {
-        for code in ["1", "11", "not-a-code", "", "-1", "-251", "-250"] {
-            assert!(
-                !is_sqlite_busy_code(Some(code)),
-                "SQLite result code {code:?} must not be retried"
+    fn is_sqlite_busy_routes_locked_away_from_retry_and_keeps_busy() {
+        let cases = [
+            // SQLITE_BUSY primary and extended result codes.
+            ("5", true),
+            ("261", true),
+            ("517", true),
+            ("773", true),
+            ("1029", true),
+            // SQLITE_LOCKED and other non-BUSY result codes.
+            ("6", false),
+            ("262", false),
+            ("-251", false),
+            ("19", false),
+        ];
+
+        for (code, expected) in cases {
+            let error = sqlx::Error::Database(Box::new(InjectedDatabaseError::new(code)));
+
+            let extracted_code = error
+                .as_database_error()
+                .and_then(|database_error| database_error.code());
+
+            assert_eq!(
+                extracted_code.as_deref(),
+                Some(code),
+                "SQLx database error code extraction failed for {code}"
+            );
+
+            assert_eq!(
+                is_sqlite_busy(&error),
+                expected,
+                "unexpected BUSY classification for SQLite code {code}"
             );
         }
-        assert!(!is_sqlite_busy_code(None));
     }
 
     fn test_entry(session: &str, content: &str) -> MemoryEntry {
