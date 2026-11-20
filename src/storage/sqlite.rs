@@ -10,6 +10,7 @@ use sqlx::{
 use uuid::Uuid;
 
 use crate::adapter::{AdapterError, AdapterResult, MemoryAdapter, MemoryEntry, Query};
+use crate::context::injector::escape_context_content;
 use crate::pruning::{EbbinghausPolicy, PruneReport};
 
 /// SQLite implementation of MemoryAdapter.
@@ -27,6 +28,121 @@ pub const PRUNE_BATCH_SIZE: usize = 256;
 
 pub struct SqliteStorage {
     pool: SqlitePool,
+}
+
+// Serialize schema creation and migration across independent processes. BEGIN IMMEDIATE
+// acquires SQLite's reserved write lock before inspecting the schema, so a second
+// opener re-checks the column only after the first migration has committed.
+async fn initialize_schema(pool: &SqlitePool) -> AdapterResult<()> {
+    let mut connection = pool.acquire().await.map_err(storage_error)?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *connection)
+        .await
+        .map_err(storage_error)?;
+
+    let migration = async {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY NOT NULL,
+                session_id TEXT NOT NULL,
+                work_item_id TEXT,
+                content TEXT NOT NULL,
+                embedding_json TEXT,
+                metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                access_count INTEGER NOT NULL CHECK (access_count >= 0),
+                last_accessed TEXT NOT NULL
+            )",
+        )
+        .execute(&mut *connection)
+        .await
+        .map_err(storage_error)?;
+
+        // This check intentionally happens after BEGIN IMMEDIATE. Another process
+        // may have migrated while this connection was waiting for the write lock.
+        let columns = sqlx::query("PRAGMA table_info(memories)")
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(storage_error)?;
+        let has_work_item_id = columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == "work_item_id");
+        if !has_work_item_id {
+            sqlx::query("ALTER TABLE memories ADD COLUMN work_item_id TEXT")
+                .execute(&mut *connection)
+                .await
+                .map_err(storage_error)?;
+            #[cfg(test)]
+            {
+                if let Some(hook) = crate::test_support::schema_migration_hook() {
+                    hook("after_alter_work_item_id").map_err(|e| {
+                        AdapterError::Storage(format!("test schema hook injected failure: {e}"))
+                    })?;
+                }
+            }
+        }
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_memories_work_item_last_accessed_id ON memories(work_item_id, last_accessed DESC, id DESC)")
+            .execute(&mut *connection)
+            .await
+            .map_err(storage_error)?;
+        #[cfg(test)]
+        {
+            let indexes = sqlx::query("PRAGMA index_list(memories)")
+                .fetch_all(&mut *connection)
+                .await
+                .map_err(storage_error)?;
+            let first_index_exists = indexes
+                .iter()
+                .any(|row| row.get::<String, _>("name") == "idx_memories_work_item_last_accessed_id");
+            if let Some(hook) = crate::test_support::schema_migration_index_hook() {
+                hook("after_first_index_created", first_index_exists).map_err(|e| {
+                    AdapterError::Storage(format!("test schema hook injected failure: {e}"))
+                })?;
+            }
+        }
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memories_session_created
+             ON memories(session_id, created_at DESC)",
+        )
+        .execute(&mut *connection)
+        .await
+        .map_err(storage_error)?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at)")
+            .execute(&mut *connection)
+            .await
+            .map_err(storage_error)?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memories_session_last_accessed_id
+             ON memories(session_id, last_accessed DESC, id DESC)",
+        )
+        .execute(&mut *connection)
+        .await
+        .map_err(storage_error)?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memories_last_accessed_id
+             ON memories(last_accessed DESC, id DESC)",
+        )
+        .execute(&mut *connection)
+        .await
+        .map_err(storage_error)?;
+        Ok::<(), AdapterError>(())
+    }
+    .await;
+
+    match migration {
+        Ok(()) => {
+            sqlx::query("COMMIT")
+                .execute(&mut *connection)
+                .await
+                .map_err(storage_error)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+            Err(error)
+        }
+    }
 }
 
 impl SqliteStorage {
@@ -70,56 +186,44 @@ impl SqliteStorage {
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal);
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(options)
-            .await
-            .map_err(storage_error)?;
+        // Journal-mode migration from DELETE to WAL takes an exclusive lock that
+        // SQLite cannot wait on with `busy_timeout()`. When two processes open a
+        // non-WAL database at the same time, the loser gets SQLITE_BUSY before
+        // `initialize_schema()` runs. Retry only that transient case.
+        let mut busy_retries = 0_u32;
+        let pool = loop {
+            let result = SqlitePoolOptions::new()
+                .max_connections(5)
+                .connect_with(options.clone())
+                .await;
 
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS memories (
-                id TEXT PRIMARY KEY NOT NULL,
-                session_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                embedding_json TEXT,
-                metadata_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                access_count INTEGER NOT NULL CHECK (access_count >= 0),
-                last_accessed TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .map_err(storage_error)?;
+            match result {
+                Ok(pool) => break pool,
+                Err(error) => {
+                    // SQLite extended result codes keep the primary code in the
+                    // low byte, so this also covers SQLITE_BUSY_RECOVERY and
+                    // SQLITE_BUSY_SNAPSHOT.
+                    let is_sqlite_busy = match &error {
+                        sqlx::Error::Database(db_error) => db_error
+                            .code()
+                            .and_then(|code| code.parse::<i32>().ok())
+                            .is_some_and(|code| code & 0xff == 5),
+                        _ => false,
+                    };
 
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_memories_session_created
-             ON memories(session_id, created_at DESC)",
-        )
-        .execute(&pool)
-        .await
-        .map_err(storage_error)?;
+                    if !is_sqlite_busy || busy_retries >= 7 {
+                        return Err(storage_error(error));
+                    }
 
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at)")
-            .execute(&pool)
-            .await
-            .map_err(storage_error)?;
+                    // Bounded backoff: 50, 100, 200, 400, then 800 ms.
+                    let backoff_ms = 50_u64 * (1_u64 << busy_retries.min(4));
+                    busy_retries += 1;
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+            }
+        };
 
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_memories_session_last_accessed_id
-             ON memories(session_id, last_accessed DESC, id DESC)",
-        )
-        .execute(&pool)
-        .await
-        .map_err(storage_error)?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_memories_last_accessed_id
-             ON memories(last_accessed DESC, id DESC)",
-        )
-        .execute(&pool)
-        .await
-        .map_err(storage_error)?;
+        initialize_schema(&pool).await?;
 
         Ok(Self { pool })
     }
@@ -195,11 +299,13 @@ impl SqliteStorage {
         };
 
         let mut last_seen_id = String::new(); // empty string sorts before all UUIDs
+        #[cfg(test)]
+        let mut successful_delete_ordinal = 0usize;
 
         loop {
             // Fetch one batch using keyset pagination.
             let rows = sqlx::query(
-                "SELECT id, session_id, content, embedding_json, metadata_json,
+                "SELECT id, session_id, work_item_id, content, embedding_json, metadata_json,
                         created_at, access_count, last_accessed
                  FROM memories
                  WHERE id > ? AND id <= ?
@@ -277,6 +383,17 @@ impl SqliteStorage {
 
                     if result.rows_affected() == 1 {
                         report.entries_deleted += 1;
+                        #[cfg(test)]
+                        {
+                            successful_delete_ordinal += 1;
+                            if let Some(hook) = crate::test_support::prune_delete_hook() {
+                                hook(successful_delete_ordinal).map_err(|e| {
+                                    AdapterError::Storage(format!(
+                                        "test DELETE hook injected failure: {e}"
+                                    ))
+                                })?;
+                            }
+                        }
                     }
                     // rows_affected == 0 means record was concurrently modified;
                     // skip it (will be re-evaluated in a future prune run).
@@ -303,11 +420,12 @@ impl MemoryAdapter for SqliteStorage {
         let metadata_json = serde_json::to_string(&entry.metadata)?;
 
         sqlx::query(
-            "INSERT INTO memories (id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO memories (id, session_id, work_item_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(entry.id.to_string())
         .bind(&entry.session_id)
+        .bind(&entry.work_item_id)
         .bind(&entry.content)
         .bind(embedding_json)
         .bind(metadata_json)
@@ -337,45 +455,49 @@ impl MemoryAdapter for SqliteStorage {
 
         let mut tx = self.pool.begin().await.map_err(storage_error)?;
 
-        let (recent_rows, older_rows) = if let Some(session_id) = &query.session_id {
-            let recent_rows = sqlx::query(
-                "SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories WHERE session_id = ? ORDER BY last_accessed DESC, id DESC LIMIT ?",
-            )
-            .bind(session_id)
-            .bind(recent_slots as i64)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(storage_error)?;
-
-            let older_rows = sqlx::query(
-                "SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories WHERE session_id = ? ORDER BY last_accessed ASC, id ASC LIMIT ?",
-            )
-            .bind(session_id)
-            .bind(older_slots as i64)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(storage_error)?;
-
-            (recent_rows, older_rows)
-        } else {
-            let recent_rows = sqlx::query(
-                "SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories ORDER BY last_accessed DESC, id DESC LIMIT ?",
-            )
-            .bind(recent_slots as i64)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(storage_error)?;
-
-            let older_rows = sqlx::query(
-                "SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories ORDER BY last_accessed ASC, id ASC LIMIT ?",
-            )
-            .bind(older_slots as i64)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(storage_error)?;
-
-            (recent_rows, older_rows)
+        // Candidate selection keeps the 80/20 recent/older split and applies the
+        // same work-item/session scope predicate to both layers.
+        let filter_clause = match (&query.work_item_id, &query.session_id) {
+            (Some(_), Some(_)) => " WHERE work_item_id = ? AND session_id = ?",
+            (Some(_), None) => " WHERE work_item_id = ?",
+            (None, Some(_)) => " WHERE session_id = ?",
+            (None, None) => "",
         };
+
+        let recent_sql = format!(
+            "SELECT id, session_id, work_item_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories{} ORDER BY last_accessed DESC, id DESC LIMIT ?",
+            filter_clause
+        );
+        let older_sql = format!(
+            "SELECT id, session_id, work_item_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories{} ORDER BY last_accessed ASC, id ASC LIMIT ?",
+            filter_clause
+        );
+
+        let mut recent_query = sqlx::query(&recent_sql);
+        if let Some(work_item_id) = &query.work_item_id {
+            recent_query = recent_query.bind(work_item_id);
+        }
+        if let Some(session_id) = &query.session_id {
+            recent_query = recent_query.bind(session_id);
+        }
+        let recent_rows = recent_query
+            .bind(recent_slots as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+
+        let mut older_query = sqlx::query(&older_sql);
+        if let Some(work_item_id) = &query.work_item_id {
+            older_query = older_query.bind(work_item_id);
+        }
+        if let Some(session_id) = &query.session_id {
+            older_query = older_query.bind(session_id);
+        }
+        let older_rows = older_query
+            .bind(older_slots as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage_error)?;
 
         // Deduplicate by TEXT id. Recent-layer rows take priority.
         let mut seen_ids = std::collections::HashSet::<String>::new();
@@ -452,7 +574,7 @@ impl MemoryAdapter for SqliteStorage {
 
         let mut tx = self.pool.begin().await.map_err(storage_error)?;
 
-        let rows = sqlx::query("SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories WHERE session_id = ? ORDER BY last_accessed DESC, created_at DESC LIMIT 10")
+        let rows = sqlx::query("SELECT id, session_id, work_item_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories WHERE session_id = ? ORDER BY last_accessed DESC, created_at DESC LIMIT 10")
             .bind(session_id)
             .fetch_all(&mut *tx)
             .await
@@ -482,7 +604,13 @@ impl MemoryAdapter for SqliteStorage {
 
         let context = entries
             .iter()
-            .map(|e| format!("[{}] {}", e.created_at.to_rfc3339(), e.content))
+            .map(|e| {
+                format!(
+                    "[{}] {}",
+                    e.created_at.to_rfc3339(),
+                    escape_context_content(&e.content)
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -543,6 +671,7 @@ fn decode_entry(row: &sqlx::sqlite::SqliteRow) -> AdapterResult<MemoryEntry> {
     Ok(MemoryEntry {
         id,
         session_id: row.try_get("session_id").map_err(storage_error)?,
+        work_item_id: row.try_get("work_item_id").map_err(storage_error)?,
         content: row.try_get("content").map_err(storage_error)?,
         embedding,
         metadata,
@@ -697,6 +826,7 @@ mod tests {
         MemoryEntry {
             id: uuid::Uuid::new_v4(),
             session_id: session.into(),
+            work_item_id: None,
             content: content.into(),
             embedding: Some(vec![0.1, 0.2, 0.3]),
             metadata: serde_json::json!({"source": "unit-test"}),
@@ -878,6 +1008,7 @@ mod tests {
         let q = Query {
             text: "special keyword".into(),
             session_id: Some(session.into()),
+            work_item_id: None,
             limit: 200,
             threshold: 0.0,
         };
@@ -914,6 +1045,7 @@ mod tests {
             let q = Query {
                 text: format!("acc {}", i),
                 session_id: Some(session.into()),
+                work_item_id: None,
                 limit: 1,
                 threshold: 0.0,
             };
@@ -1124,6 +1256,7 @@ mod tests {
 
         let query = Query {
             text: "unique wal access statistics verification".into(),
+            work_item_id: None,
             session_id: Some(session.into()),
             limit: 1,
             threshold: 0.0,
@@ -1209,6 +1342,7 @@ mod tests {
         // Read.
         let query = Query {
             text: "wal crud operation verification".into(),
+            work_item_id: None,
             session_id: Some(session.into()),
             limit: 1,
             threshold: 0.0,
@@ -1279,6 +1413,7 @@ mod tests {
 
         let query = Query {
             text: "persistent memory".into(),
+            work_item_id: None,
             session_id: Some(session.into()),
             limit: expected_contents.len(),
             threshold: 0.0,
@@ -1501,6 +1636,7 @@ mod tests {
 
             let query = Query {
                 text: MATCHING_QUERY.into(),
+                work_item_id: None,
                 session_id: Some(session.into()),
                 limit: query_limit,
                 threshold,
@@ -1547,5 +1683,574 @@ mod tests {
             drop(storage);
             remove_db_files(&path);
         }
+    }
+
+    /// Failure injection after a successful DELETE inside the second batch.
+    /// The first batch remains committed while the entire failing transaction rolls back.
+    #[tokio::test]
+    #[ignore = "global hook; run with --ignored --test-threads=1"]
+    async fn prune_rolls_back_failure_after_delete_within_batch() {
+        let (storage, path) = open_test_db("in-batch-rollback").await;
+        let old = Utc::now() - ChronoDuration::days(365);
+        let mut ids = Vec::new();
+
+        for index in 0..258_u128 {
+            let mut entry = test_entry("in-batch-rollback", &format!("rollback victim {index}"));
+            entry.id = Uuid::from_u128(index + 1);
+            entry.created_at = old;
+            entry.last_accessed = old;
+            entry.access_count = 1;
+            ids.push(entry.id.to_string());
+            storage.store(entry).await.unwrap();
+        }
+
+        const FAILURE: &str = "F07_PRUNE_AFTER_FIRST_DELETE_IN_SECOND_BATCH";
+        let _guard =
+            crate::test_support::set_prune_delete_hook(Arc::new(|successful_delete_ordinal| {
+                if successful_delete_ordinal == 257 {
+                    Err(FAILURE.to_string())
+                } else {
+                    Ok(())
+                }
+            }));
+
+        let policy = EbbinghausPolicy::default();
+        let error = match storage.prune_ebbinghaus(&policy, Utc::now()).await {
+            Ok(_) => panic!("prune must fail after the first DELETE in batch two"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(FAILURE),
+            "error must preserve injected failure identifier: {error}"
+        );
+        drop(_guard);
+
+        let committed_batch_count: i64 = sqlx::query("SELECT COUNT(*) FROM memories WHERE id <= ?")
+            .bind(&ids[255])
+            .fetch_one(storage.pool())
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            committed_batch_count, 0,
+            "all 256 records in the previously committed batch must remain deleted"
+        );
+
+        let failed_batch = sqlx::query(
+            "SELECT id, access_count, last_accessed FROM memories WHERE id > ? ORDER BY id",
+        )
+        .bind(&ids[255])
+        .fetch_all(storage.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            failed_batch.len(),
+            2,
+            "both records in the failed batch must remain"
+        );
+        for (index, row) in failed_batch.iter().enumerate() {
+            assert_eq!(row.get::<String, _>("id"), ids[256 + index]);
+            assert_eq!(row.get::<i32, _>("access_count"), 1);
+            assert_eq!(
+                row.get::<String, _>("last_accessed"),
+                old.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                "failed-batch access metadata must be unchanged"
+            );
+        }
+
+        let retry = storage
+            .prune_ebbinghaus(&policy, Utc::now())
+            .await
+            .expect("retry must delete the rolled-back batch");
+        assert_eq!(retry.entries_examined, 2);
+        assert_eq!(retry.entries_deleted, 2);
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories")
+            .fetch_one(storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+
+        let second_retry = storage
+            .prune_ebbinghaus(&policy, Utc::now())
+            .await
+            .expect("subsequent retry must remain safe");
+        assert_eq!(second_retry.entries_examined, 0);
+        assert_eq!(second_retry.entries_deleted, 0);
+
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Failure injection after ALTER TABLE verifies transactional DDL rollback,
+    /// legacy-row preservation, and successful retry of the migration.
+    #[tokio::test]
+    #[ignore = "global hook; run with --ignored --test-threads=1"]
+    async fn initialize_schema_rolls_back_ddl_failure_after_alter() {
+        let path =
+            std::env::temp_dir().join(format!("unit-test-schema-rollback-{}.db", Uuid::new_v4()));
+        let legacy_rows = vec![
+            (
+                Uuid::from_u128(0x1001).to_string(),
+                "legacy-session-a".to_string(),
+                "legacy migration row alpha".to_string(),
+                None,
+                r#"{"source":"legacy-a"}"#.to_string(),
+                "2024-01-01T00:00:00.000000000Z".to_string(),
+                3_i32,
+                "2024-03-03T00:00:00.000000000Z".to_string(),
+            ),
+            (
+                Uuid::from_u128(0x1002).to_string(),
+                "legacy-session-b".to_string(),
+                "legacy migration row beta".to_string(),
+                Some("[0.125,-0.5,0.75]".to_string()),
+                r#"{"source":"legacy-b","rev":2}"#.to_string(),
+                "2024-02-02T00:00:00.000000000Z".to_string(),
+                7_i32,
+                "2024-04-04T00:00:00.000000000Z".to_string(),
+            ),
+        ];
+
+        let legacy_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE memories (
+                id TEXT PRIMARY KEY NOT NULL,
+                session_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                embedding_json TEXT,
+                metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                access_count INTEGER NOT NULL CHECK (access_count >= 0),
+                last_accessed TEXT NOT NULL
+            )",
+        )
+        .execute(&legacy_pool)
+        .await
+        .unwrap();
+        for (id, session, content, embedding, metadata, created_at, access_count, last_accessed) in
+            &legacy_rows
+        {
+            sqlx::query(
+                "INSERT INTO memories
+                 (id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(session)
+            .bind(content)
+            .bind(embedding)
+            .bind(metadata)
+            .bind(created_at)
+            .bind(access_count)
+            .bind(last_accessed)
+            .execute(&legacy_pool)
+            .await
+            .unwrap();
+        }
+        legacy_pool.close().await;
+
+        const FAILURE: &str = "F07_SCHEMA_FAILURE_AFTER_ALTER";
+        let _guard = crate::test_support::set_schema_migration_hook(Arc::new(|stage| {
+            if stage == "after_alter_work_item_id" {
+                Err(FAILURE.to_string())
+            } else {
+                Ok(())
+            }
+        }));
+        let open_error = match SqliteStorage::open(&path).await {
+            Ok(_) => panic!("open must fail after the injected schema change"),
+            Err(error) => error,
+        };
+        assert!(
+            open_error.to_string().contains(FAILURE),
+            "open error must preserve injected failure identifier: {open_error}"
+        );
+        drop(_guard);
+
+        let inspect_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&path))
+            .await
+            .unwrap();
+        let rolled_back_columns = sqlx::query("PRAGMA table_info(memories)")
+            .fetch_all(&inspect_pool)
+            .await
+            .unwrap();
+        let rolled_back_names = rolled_back_columns
+            .iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rolled_back_names,
+            vec![
+                "id",
+                "session_id",
+                "content",
+                "embedding_json",
+                "metadata_json",
+                "created_at",
+                "access_count",
+                "last_accessed"
+            ],
+            "ALTER must be rolled back without duplicate or partial columns"
+        );
+        let rolled_back_indexes = sqlx::query("PRAGMA index_list(memories)")
+            .fetch_all(&inspect_pool)
+            .await
+            .unwrap();
+        let expected_indexes = [
+            "idx_memories_work_item_last_accessed_id",
+            "idx_memories_session_created",
+            "idx_memories_created",
+            "idx_memories_session_last_accessed_id",
+            "idx_memories_last_accessed_id",
+        ];
+        for expected in expected_indexes {
+            assert!(
+                !rolled_back_indexes
+                    .iter()
+                    .any(|row| row.get::<String, _>("name") == expected),
+                "failed migration must not leave index {expected}"
+            );
+        }
+
+        let read_legacy_rows = |rows: Vec<sqlx::sqlite::SqliteRow>| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.get::<String, _>("id"),
+                        row.get::<String, _>("session_id"),
+                        row.get::<String, _>("content"),
+                        row.get::<Option<String>, _>("embedding_json"),
+                        row.get::<String, _>("metadata_json"),
+                        row.get::<String, _>("created_at"),
+                        row.get::<i32, _>("access_count"),
+                        row.get::<String, _>("last_accessed"),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let before_retry =
+            sqlx::query("SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories ORDER BY id")
+                .fetch_all(&inspect_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            read_legacy_rows(before_retry),
+            legacy_rows,
+            "all legacy rows and values must survive failed migration"
+        );
+        inspect_pool.close().await;
+
+        let storage = SqliteStorage::open(&path)
+            .await
+            .expect("second open must complete migration");
+        let migrated_columns = sqlx::query("PRAGMA table_info(memories)")
+            .fetch_all(storage.pool())
+            .await
+            .unwrap();
+        let migrated_names = migrated_columns
+            .iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Vec<_>>();
+        let unique_names = migrated_names
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            migrated_names.len(),
+            unique_names.len(),
+            "column names must be unique"
+        );
+        assert_eq!(
+            migrated_names.len(),
+            9,
+            "legacy schema must contain its eight original columns plus work_item_id"
+        );
+        assert_eq!(
+            migrated_names
+                .iter()
+                .filter(|name| name.as_str() == "work_item_id")
+                .count(),
+            1
+        );
+
+        let migrated_indexes = sqlx::query("PRAGMA index_list(memories)")
+            .fetch_all(storage.pool())
+            .await
+            .unwrap();
+        for expected in expected_indexes {
+            assert!(
+                migrated_indexes
+                    .iter()
+                    .any(|row| row.get::<String, _>("name") == expected),
+                "successful retry must create index {expected}"
+            );
+        }
+
+        let migrated_rows =
+            sqlx::query("SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories ORDER BY id")
+                .fetch_all(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            read_legacy_rows(migrated_rows),
+            legacy_rows,
+            "all legacy rows must remain intact after retry"
+        );
+
+        let new_entry = test_entry("legacy-session-a", "store after migration rollback probe");
+        storage.store(new_entry.clone()).await.unwrap();
+        let query_results = storage
+            .query(&Query {
+                text: "migration rollback probe".into(),
+                session_id: Some("legacy-session-a".into()),
+                work_item_id: None,
+                limit: 5,
+                threshold: 1.0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(query_results.len(), 1);
+        assert_eq!(query_results[0].id, new_entry.id);
+
+        let context = storage.inject_context("legacy-session-a").await.unwrap();
+        assert!(context.contains("legacy migration row alpha"));
+        assert!(context.contains("store after migration rollback probe"));
+
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Failure injection after the first migration index exists in the active DDL transaction.
+    /// The hook receives an in-transaction PRAGMA observation proving the index was created.
+    #[tokio::test]
+    #[ignore = "global hook; run with --ignored --test-threads=1"]
+    async fn initialize_schema_rolls_back_index_failure_after_first_index() {
+        let path =
+            std::env::temp_dir().join(format!("unit-test-index-rollback-{}.db", Uuid::new_v4()));
+        let legacy_rows = vec![
+            (
+                Uuid::from_u128(0x2001).to_string(),
+                "index-session-a".to_string(),
+                "legacy index row alpha".to_string(),
+                None,
+                r#"{"source":"legacy-a"}"#.to_string(),
+                "2024-05-05T00:00:00.000000000Z".to_string(),
+                3_i32,
+                "2024-07-07T00:00:00.000000000Z".to_string(),
+            ),
+            (
+                Uuid::from_u128(0x2002).to_string(),
+                "index-session-b".to_string(),
+                "legacy index row beta".to_string(),
+                Some("[0.125,-0.5,0.75]".to_string()),
+                r#"{"source":"legacy-b","rev":2}"#.to_string(),
+                "2024-06-06T00:00:00.000000000Z".to_string(),
+                7_i32,
+                "2024-08-08T00:00:00.000000000Z".to_string(),
+            ),
+        ];
+
+        let legacy_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE memories (
+                id TEXT PRIMARY KEY NOT NULL,
+                session_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                embedding_json TEXT,
+                metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                access_count INTEGER NOT NULL CHECK (access_count >= 0),
+                last_accessed TEXT NOT NULL
+            )",
+        )
+        .execute(&legacy_pool)
+        .await
+        .unwrap();
+        for (id, session, content, embedding, metadata, created_at, access_count, last_accessed) in
+            &legacy_rows
+        {
+            sqlx::query(
+                "INSERT INTO memories
+                 (id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(session)
+            .bind(content)
+            .bind(embedding)
+            .bind(metadata)
+            .bind(created_at)
+            .bind(access_count)
+            .bind(last_accessed)
+            .execute(&legacy_pool)
+            .await
+            .unwrap();
+        }
+        legacy_pool.close().await;
+
+        const FAILURE: &str = "F08_SCHEMA_FAILURE_AFTER_FIRST_INDEX";
+        let _guard = crate::test_support::set_schema_migration_index_hook(Arc::new(
+            |stage, first_index_exists| {
+                assert_eq!(stage, "after_first_index_created");
+                assert!(
+                    first_index_exists,
+                    "first migration index must be visible on the same transaction connection before injection"
+                );
+                Err(FAILURE.to_string())
+            },
+        ));
+        let open_error = match SqliteStorage::open(&path).await {
+            Ok(_) => panic!("open must fail after the first migration index is created"),
+            Err(error) => error,
+        };
+        assert!(
+            open_error.to_string().contains(FAILURE),
+            "open error must preserve injected failure identifier: {open_error}"
+        );
+        drop(_guard);
+
+        let expected_indexes = [
+            "idx_memories_work_item_last_accessed_id",
+            "idx_memories_session_created",
+            "idx_memories_created",
+            "idx_memories_session_last_accessed_id",
+            "idx_memories_last_accessed_id",
+        ];
+        let inspect_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&path))
+            .await
+            .unwrap();
+        let rolled_back_indexes = sqlx::query("PRAGMA index_list(memories)")
+            .fetch_all(&inspect_pool)
+            .await
+            .unwrap();
+        for expected in expected_indexes {
+            assert!(
+                !rolled_back_indexes
+                    .iter()
+                    .any(|row| row.get::<String, _>("name") == expected),
+                "failed migration must roll back index {expected}"
+            );
+        }
+        let rolled_back_columns = sqlx::query("PRAGMA table_info(memories)")
+            .fetch_all(&inspect_pool)
+            .await
+            .unwrap();
+        assert!(
+            !rolled_back_columns
+                .iter()
+                .any(|row| row.get::<String, _>("name") == "work_item_id"),
+            "ALTER must roll back together with index creation"
+        );
+
+        let read_legacy_rows = |rows: Vec<sqlx::sqlite::SqliteRow>| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.get::<String, _>("id"),
+                        row.get::<String, _>("session_id"),
+                        row.get::<String, _>("content"),
+                        row.get::<Option<String>, _>("embedding_json"),
+                        row.get::<String, _>("metadata_json"),
+                        row.get::<String, _>("created_at"),
+                        row.get::<i32, _>("access_count"),
+                        row.get::<String, _>("last_accessed"),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected_legacy_rows = legacy_rows.clone();
+        let before_retry =
+            sqlx::query("SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories ORDER BY id")
+                .fetch_all(&inspect_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            read_legacy_rows(before_retry),
+            expected_legacy_rows,
+            "legacy rows and all requested values must survive failed migration"
+        );
+        inspect_pool.close().await;
+
+        let storage = SqliteStorage::open(&path)
+            .await
+            .expect("reopening without the hook must complete migration");
+        let migrated_columns = sqlx::query("PRAGMA table_info(memories)")
+            .fetch_all(storage.pool())
+            .await
+            .unwrap();
+        assert!(
+            migrated_columns
+                .iter()
+                .any(|row| row.get::<String, _>("name") == "work_item_id"),
+            "successful retry must add work_item_id"
+        );
+        let migrated_indexes = sqlx::query("PRAGMA index_list(memories)")
+            .fetch_all(storage.pool())
+            .await
+            .unwrap();
+        for expected in expected_indexes {
+            assert!(
+                migrated_indexes
+                    .iter()
+                    .any(|row| row.get::<String, _>("name") == expected),
+                "successful retry must create index {expected}"
+            );
+        }
+        let after_retry =
+            sqlx::query("SELECT id, session_id, content, embedding_json, metadata_json, created_at, access_count, last_accessed FROM memories ORDER BY id")
+                .fetch_all(storage.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            read_legacy_rows(after_retry),
+            expected_legacy_rows,
+            "legacy rows must remain intact after successful retry"
+        );
+
+        let mut new_entry = test_entry("index-session-a", "scoped index migration probe");
+        new_entry.work_item_id = Some("work-item-f08".into());
+        storage.store(new_entry.clone()).await.unwrap();
+        let scoped_results = storage
+            .query(&Query {
+                text: "scoped index migration probe".into(),
+                session_id: Some("index-session-a".into()),
+                work_item_id: Some("work-item-f08".into()),
+                limit: 5,
+                threshold: 1.0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(scoped_results.len(), 1);
+        assert_eq!(scoped_results[0].id, new_entry.id);
+        assert_eq!(
+            scoped_results[0].work_item_id.as_deref(),
+            Some("work-item-f08")
+        );
+
+        let context = storage.inject_context("index-session-a").await.unwrap();
+        assert!(context.contains("legacy index row alpha"));
+        assert!(context.contains("scoped index migration probe"));
+
+        drop(storage);
+        let _ = std::fs::remove_file(path);
     }
 }

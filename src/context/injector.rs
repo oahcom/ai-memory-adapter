@@ -57,6 +57,39 @@ pub struct ContextResult {
     pub chars_used: usize,
 }
 
+// Encode untrusted metadata fields so structural delimiters cannot be injected.
+pub(crate) fn escape_context_field(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+            escaped.push(ch);
+        } else {
+            escaped.push_str(&format!("\\u{{{:x}}}", ch as u32));
+        }
+    }
+    escaped
+}
+
+// Escape control characters and backslashes so content cannot create another
+// physical record or forge a literal escape sequence.
+pub(crate) fn escape_context_content(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '[' | ']' => escaped.push_str(&format!("\\u{{{:x}}}", ch as u32)),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') => {
+                escaped.push_str(&format!("\\u{{{:x}}}", ch as u32));
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 /// Builds a bounded context from an existing memory adapter.
 pub struct ContextInjector<'a> {
     adapter: &'a dyn MemoryAdapter,
@@ -86,6 +119,7 @@ impl<'a> ContextInjector<'a> {
         let query = Query {
             text: query_text.to_owned(),
             session_id: Some(session_id.to_owned()),
+            work_item_id: None,
             limit: self.config.max_entries,
             threshold: self.config.min_score,
         };
@@ -98,7 +132,8 @@ impl<'a> ContextInjector<'a> {
         let mut chars_used = 0;
 
         for memory in memories {
-            let line = format!("[{}] {}", memory.created_at.to_rfc3339(), memory.content);
+            let escaped_content = escape_context_content(&memory.content);
+            let line = format!("[{}] {}", memory.created_at.to_rfc3339(), escaped_content);
             let line_chars = line.chars().count();
             let separator_chars = if text.is_empty() { 0 } else { 1 };
             let required_chars = line_chars.saturating_add(separator_chars);
@@ -116,6 +151,69 @@ impl<'a> ContextInjector<'a> {
             entries_included += 1;
         }
 
+        Ok(ContextResult {
+            text,
+            entries_included,
+            entries_omitted,
+            chars_used,
+        })
+    }
+    /// Retrieve relevant memories across sessions, restricted to one work item.
+    pub async fn inject_work_item(
+        &self,
+        work_item_id: &str,
+        query_text: &str,
+    ) -> AdapterResult<ContextResult> {
+        if work_item_id.trim().is_empty() || query_text.trim().is_empty() {
+            return Err(AdapterError::Validation(
+                "work_item_id and query_text must not be empty".into(),
+            ));
+        }
+        let query = Query {
+            text: query_text.to_owned(),
+            session_id: None,
+            work_item_id: Some(work_item_id.to_owned()),
+            limit: self.config.max_entries,
+            threshold: self.config.min_score,
+        };
+        let memories = self.adapter.query(&query).await?;
+        let mut text = String::new();
+        let mut entries_included = 0;
+        let mut entries_omitted = 0;
+        let mut chars_used = 0;
+        for memory in memories {
+            // Fail closed if an adapter violates the requested scope. Do not
+            // label an out-of-scope memory with the caller's Work Item ID.
+            if memory.work_item_id.as_deref() != Some(work_item_id) {
+                return Err(AdapterError::Storage(format!(
+                    "adapter returned memory {} outside requested Work Item scope {}",
+                    memory.id, work_item_id
+                )));
+            }
+            let escaped_work_item_id = escape_context_field(work_item_id);
+            let escaped_session_id = escape_context_field(&memory.session_id);
+            let escaped_content = escape_context_content(&memory.content);
+            let line = format!(
+                "[memory_id={} work_item_id={} session_id={} created_at={}] {}",
+                memory.id,
+                escaped_work_item_id,
+                escaped_session_id,
+                memory.created_at.to_rfc3339(),
+                escaped_content
+            );
+            let separator_chars = if text.is_empty() { 0 } else { 1 };
+            let required_chars = line.chars().count().saturating_add(separator_chars);
+            if required_chars > self.config.max_chars.saturating_sub(chars_used) {
+                entries_omitted += 1;
+                continue;
+            }
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&line);
+            chars_used += required_chars;
+            entries_included += 1;
+        }
         Ok(ContextResult {
             text,
             entries_included,
