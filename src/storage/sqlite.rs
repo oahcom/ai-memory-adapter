@@ -4,7 +4,7 @@ use std::{collections::HashSet, path::Path, time::Duration};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
     Row, SqlitePool,
 };
 use uuid::Uuid;
@@ -30,12 +30,45 @@ pub struct SqliteStorage {
 }
 
 impl SqliteStorage {
+    /// Opens a SQLite-backed memory store.
+    ///
+    /// WAL journal mode and NORMAL synchronous mode are explicitly configured
+    /// to avoid depending on sqlx defaults.
+    ///
+    /// Persistence contract:
+    ///
+    /// - `access_count` and `last_accessed` are non-critical access statistics,
+    ///   rather than authoritative business data. Losing recent updates is
+    ///   acceptable.
+    /// - WAL with NORMAL synchronous mode preserves committed transactions
+    ///   across application/process crashes.
+    /// - An operating-system crash or sudden power loss may discard recently
+    ///   committed transactions that have not yet reached durable storage.
+    /// - This reduced durability guarantee does not mean SQLite may leave
+    ///   the database corrupted. SQLite maintains database consistency.
+    /// - These settings must not be applied to business data that requires
+    ///   FULL synchronous durability.
+    ///
+    /// Deployment requirement:
+    ///
+    /// WAL relies on shared-memory coordination and is intended for local
+    /// filesystems. Network filesystems must be independently validated
+    /// for WAL compatibility before deployment.
+    ///
+    /// Explicit configuration is intentional: the previous implementation
+    /// relied on sqlx defaults, which left journal_mode at DELETE and
+    /// synchronous at FULL. Each retrieval therefore incurred a rollback-
+    /// journal full synchronization during its access-statistics transaction.
+    /// Explicit settings prevent future third-party default changes from
+    /// silently restoring that performance behavior.
     pub async fn open(path: impl AsRef<Path>) -> AdapterResult<Self> {
         let options = SqliteConnectOptions::new()
             .filename(path.as_ref())
             .create_if_missing(true)
             .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(5));
+            .busy_timeout(Duration::from_secs(5))
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal);
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -975,5 +1008,397 @@ mod tests {
     fn lexical_score_keeps_multi_character_cjk_after_range_widening() {
         assert!(lexical_score(&tokenize("天气"), "今天天气很好") > 0.34);
         assert!(lexical_score(&tokenize("机器学"), "机器学习是人工智能") > 0.34);
+    }
+    // --------------------------------------------------------
+    // Test helpers
+    // --------------------------------------------------------
+
+    fn temp_db_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ai-memory-{}-{}.sqlite3", tag, Uuid::new_v4()))
+    }
+
+    fn remove_db_files(path: &std::path::Path) {
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let mut p = path.as_os_str().to_os_string();
+            p.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+        }
+    }
+
+    // --------------------------------------------------------
+    // Test 1: New connections explicitly use WAL + NORMAL
+    // --------------------------------------------------------
+
+    #[tokio::test]
+    async fn open_sets_wal_and_normal_synchronous() {
+        let path = temp_db_path("pragma-new");
+        let storage = SqliteStorage::open(&path).await.unwrap();
+
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(mode.to_lowercase(), "wal", "journal_mode must be WAL");
+
+        let sync: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(sync, 1, "synchronous must be NORMAL (1)");
+
+        drop(storage);
+        remove_db_files(&path);
+    }
+
+    // --------------------------------------------------------
+    // Test 2: Reopening an existing database retains WAL
+    // --------------------------------------------------------
+
+    #[tokio::test]
+    async fn reopening_existing_database_keeps_wal() {
+        let path = temp_db_path("pragma-reopen");
+
+        {
+            let _storage = SqliteStorage::open(&path).await.unwrap();
+        }
+
+        let storage = SqliteStorage::open(&path).await.unwrap();
+
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mode.to_lowercase(),
+            "wal",
+            "reopened database must retain WAL journal mode"
+        );
+
+        let sync: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sync, 1,
+            "new connections must explicitly use NORMAL synchronous mode"
+        );
+
+        drop(storage);
+        remove_db_files(&path);
+    }
+
+    // --------------------------------------------------------
+    // Test 3: query() and inject_context() still update
+    // access statistics
+    // --------------------------------------------------------
+
+    #[tokio::test]
+    async fn query_and_inject_context_update_access_statistics() {
+        let path = temp_db_path("access-stats");
+        let storage = SqliteStorage::open(&path).await.unwrap();
+
+        let session = "wal-access-test";
+        let entry = test_entry(session, "unique wal access statistics verification content");
+
+        let id = entry.id;
+        storage.store(entry).await.unwrap();
+
+        let (initial_count, initial_last_accessed): (i64, String) = sqlx::query_as(
+            "SELECT access_count, last_accessed
+                 FROM memories WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(initial_count, 0);
+
+        // Ensure the timestamp comparison is not affected by clock
+        // resolution or two operations occurring in the same instant.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let query = Query {
+            text: "unique wal access statistics verification".into(),
+            session_id: Some(session.into()),
+            limit: 1,
+            threshold: 0.0,
+        };
+
+        let results = storage.query(&query).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, id);
+
+        let (query_count, query_last_accessed): (i64, String) = sqlx::query_as(
+            "SELECT access_count, last_accessed
+                 FROM memories WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            query_count,
+            initial_count + 1,
+            "query() must increment access_count"
+        );
+
+        assert_ne!(
+            query_last_accessed, initial_last_accessed,
+            "query() must update last_accessed"
+        );
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let context = storage.inject_context(session).await.unwrap();
+
+        assert!(
+            context.contains("unique wal access statistics"),
+            "inject_context() must return the stored memory"
+        );
+
+        let (inject_count, inject_last_accessed): (i64, String) = sqlx::query_as(
+            "SELECT access_count, last_accessed
+                 FROM memories WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            inject_count,
+            query_count + 1,
+            "inject_context() must increment access_count"
+        );
+
+        assert_ne!(
+            inject_last_accessed, query_last_accessed,
+            "inject_context() must update last_accessed"
+        );
+
+        drop(storage);
+        remove_db_files(&path);
+    }
+
+    // --------------------------------------------------------
+    // Test 4: CRUD and deletion continue working under WAL
+    // --------------------------------------------------------
+
+    #[tokio::test]
+    async fn crud_operations_work_with_wal() {
+        let path = temp_db_path("crud-wal");
+        let storage = SqliteStorage::open(&path).await.unwrap();
+
+        let session = "wal-crud-test";
+        let entry = test_entry(session, "wal crud operation verification content");
+
+        let id = entry.id;
+
+        // Create.
+        let stored_id = storage.store(entry).await.unwrap();
+
+        assert_eq!(stored_id, id);
+
+        // Read.
+        let query = Query {
+            text: "wal crud operation verification".into(),
+            session_id: Some(session.into()),
+            limit: 1,
+            threshold: 0.0,
+        };
+
+        let results = storage.query(&query).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, id);
+        assert_eq!(
+            results[0].content,
+            "wal crud operation verification content"
+        );
+
+        // Delete.
+        // MemoryAdapter exposes prune(before), rather than a delete(id)
+        // method. Use its production deletion path for this verification.
+        let deleted = storage
+            .prune(Utc::now() + ChronoDuration::seconds(1))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            deleted, 1,
+            "prune() must delete the stored memory under WAL"
+        );
+
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(remaining, 0, "deleted memory must no longer exist");
+
+        drop(storage);
+        remove_db_files(&path);
+    }
+
+    // --------------------------------------------------------
+    // Test 5: Committed transactions survive normal process exit
+    // --------------------------------------------------------
+
+    #[tokio::test]
+    async fn committed_data_survives_reopening_database() {
+        let path = temp_db_path("persistence");
+
+        let session = "wal-persistence-test";
+
+        let expected_contents = vec![
+            "persistent memory alpha".to_string(),
+            "persistent memory beta".to_string(),
+            "persistent memory gamma".to_string(),
+        ];
+
+        // First connection: commit several independent store operations.
+        {
+            let storage = SqliteStorage::open(&path).await.unwrap();
+
+            for content in &expected_contents {
+                let entry = test_entry(session, content);
+                storage.store(entry).await.unwrap();
+            }
+        }
+
+        // Second connection: all committed records must still exist.
+        let storage = SqliteStorage::open(&path).await.unwrap();
+
+        let query = Query {
+            text: "persistent memory".into(),
+            session_id: Some(session.into()),
+            limit: expected_contents.len(),
+            threshold: 0.0,
+        };
+
+        let results = storage.query(&query).await.unwrap();
+
+        assert_eq!(
+            results.len(),
+            expected_contents.len(),
+            "all committed records must survive reopening"
+        );
+
+        let actual: HashSet<String> = results.into_iter().map(|entry| entry.content).collect();
+
+        let expected: HashSet<String> = expected_contents.into_iter().collect();
+
+        assert_eq!(
+            actual, expected,
+            "reopened database must preserve all committed contents"
+        );
+
+        drop(storage);
+        remove_db_files(&path);
+    }
+
+    // --------------------------------------------------------
+    // Test 6: Ignored performance benchmark
+    //
+    // 488 memories, one session.
+    // Independent database for each write-back row count.
+    // 3 warmups + 30 measured iterations.
+    // Nearest-rank p50.
+    // --------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "manual P1-08 WAL/NORMAL performance benchmark"]
+    async fn bench_query_write_back_latency() {
+        use std::time::Instant;
+
+        const MEMORY_COUNT: usize = 488;
+        const WARMUP_COUNT: usize = 3;
+        const SAMPLE_COUNT: usize = 30;
+        const MATCHING_QUERY: &str = "benchmark wal memory shared query keyword";
+
+        let session = "wal-benchmark-session";
+
+        // (query text, query limit, threshold, expected rows written back)
+        //
+        // limit must be greater than zero and threshold must be within
+        // [0.0, 1.0], so the zero-write-back tier uses a query whose terms
+        // occur in no seeded memory: lexical_score returns 0.0, below the
+        // 0.5 cutoff, and nothing is matched or written back.
+        let tiers = [
+            ("absent unmatched term", 10usize, 0.5f32, 0usize),
+            (MATCHING_QUERY, 1, 0.0, 1),
+            (MATCHING_QUERY, 10, 0.0, 10),
+        ];
+
+        for (query_text, query_limit, threshold, expected_rows) in tiers {
+            let path = temp_db_path(&format!("benchmark-{}", expected_rows));
+
+            // Each measurement tier receives a fresh independent database.
+            let storage = SqliteStorage::open(&path).await.unwrap();
+
+            // Seed 488 records in the same session.
+            for i in 0..MEMORY_COUNT {
+                let entry = test_entry(session, &format!("{} item {}", MATCHING_QUERY, i));
+
+                storage.store(entry).await.unwrap();
+            }
+
+            let query = Query {
+                text: query_text.into(),
+                session_id: Some(session.into()),
+                limit: query_limit,
+                threshold,
+            };
+
+            // Warmup: excluded from measured samples.
+            for _ in 0..WARMUP_COUNT {
+                let results = storage.query(&query).await.unwrap();
+
+                assert_eq!(
+                    results.len(),
+                    expected_rows,
+                    "query must return the expected number of rows"
+                );
+            }
+
+            let mut samples: Vec<u128> = Vec::with_capacity(SAMPLE_COUNT);
+
+            for _ in 0..SAMPLE_COUNT {
+                let started = Instant::now();
+
+                let results = storage.query(&query).await.unwrap();
+
+                let elapsed = started.elapsed().as_micros();
+
+                assert_eq!(
+                    results.len(),
+                    expected_rows,
+                    "query must return the expected number of rows"
+                );
+
+                samples.push(elapsed);
+            }
+
+            // Nearest-rank p50:
+            // rank = ceil(0.50 * SAMPLE_COUNT).
+            samples.sort_unstable();
+
+            let rank = (SAMPLE_COUNT * 50).div_ceil(100);
+            let p50 = samples[rank - 1];
+
+            // Required output format.
+            println!("rows={} p50={}us", expected_rows, p50);
+
+            drop(storage);
+            remove_db_files(&path);
+        }
     }
 }
