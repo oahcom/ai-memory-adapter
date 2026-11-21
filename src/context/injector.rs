@@ -1,6 +1,7 @@
 //! Query relevant memories and assemble a bounded context.
 
 use crate::adapter::{AdapterError, AdapterResult, MemoryAdapter, Query};
+use serde_json::Value;
 
 /// Configuration for context retrieval and assembly.
 #[derive(Debug, Clone, PartialEq)]
@@ -45,7 +46,7 @@ impl ContextConfig {
 }
 
 /// Result of context assembly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ContextResult {
     /// Formatted context ready for injection.
     pub text: String,
@@ -55,6 +56,9 @@ pub struct ContextResult {
     pub entries_omitted: usize,
     /// Actual output size measured in Unicode characters.
     pub chars_used: usize,
+    /// SO provenance of each included entry, index-aligned with `text` records.
+    /// `None` means the entry carries no `_so_contract.provenance`.
+    pub provenance: Vec<Option<Value>>,
 }
 
 // Encode untrusted metadata fields so structural delimiters cannot be injected.
@@ -88,6 +92,17 @@ pub(crate) fn escape_context_content(value: &str) -> String {
         }
     }
     escaped
+}
+
+/// Renders the SO provenance of one memory for the context header.
+///
+/// A missing provenance renders as the literal `none`, never as an empty
+/// string: an empty value would be indistinguishable from a missing one.
+fn provenance_field(metadata: &Value) -> String {
+    match metadata.pointer("/_so_contract/provenance") {
+        Some(value) => escape_context_field(&value.to_string()),
+        None => "none".to_owned(),
+    }
 }
 
 /// Builds a bounded context from an existing memory adapter.
@@ -130,6 +145,7 @@ impl<'a> ContextInjector<'a> {
         let mut entries_included = 0;
         let mut entries_omitted = 0;
         let mut chars_used = 0;
+        let mut provenance = Vec::new();
 
         for memory in memories {
             let escaped_content = escape_context_content(&memory.content);
@@ -149,6 +165,7 @@ impl<'a> ContextInjector<'a> {
             text.push_str(&line);
             chars_used += required_chars;
             entries_included += 1;
+            provenance.push(memory.metadata.pointer("/_so_contract/provenance").cloned());
         }
 
         Ok(ContextResult {
@@ -156,6 +173,7 @@ impl<'a> ContextInjector<'a> {
             entries_included,
             entries_omitted,
             chars_used,
+            provenance,
         })
     }
     /// Retrieve relevant memories across sessions, restricted to one work item.
@@ -181,6 +199,7 @@ impl<'a> ContextInjector<'a> {
         let mut entries_included = 0;
         let mut entries_omitted = 0;
         let mut chars_used = 0;
+        let mut provenance = Vec::new();
         for memory in memories {
             // Fail closed if an adapter violates the requested scope. Do not
             // label an out-of-scope memory with the caller's Work Item ID.
@@ -194,11 +213,12 @@ impl<'a> ContextInjector<'a> {
             let escaped_session_id = escape_context_field(&memory.session_id);
             let escaped_content = escape_context_content(&memory.content);
             let line = format!(
-                "[memory_id={} work_item_id={} session_id={} created_at={}] {}",
+                "[memory_id={} work_item_id={} session_id={} created_at={} provenance={}] {}",
                 memory.id,
                 escaped_work_item_id,
                 escaped_session_id,
                 memory.created_at.to_rfc3339(),
+                provenance_field(&memory.metadata),
                 escaped_content
             );
             let separator_chars = if text.is_empty() { 0 } else { 1 };
@@ -213,12 +233,14 @@ impl<'a> ContextInjector<'a> {
             text.push_str(&line);
             chars_used += required_chars;
             entries_included += 1;
+            provenance.push(memory.metadata.pointer("/_so_contract/provenance").cloned());
         }
         Ok(ContextResult {
             text,
             entries_included,
             entries_omitted,
             chars_used,
+            provenance,
         })
     }
 }
