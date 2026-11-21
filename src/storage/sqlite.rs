@@ -701,7 +701,7 @@ fn is_cjk(c: char) -> bool {
 ///
 /// Punctuation separates segments and CJK runs. No external dependencies
 /// are required.
-fn tokenize(text: &str) -> HashSet<String> {
+pub fn tokenize(text: &str) -> HashSet<String> {
     let mut tokens = HashSet::new();
 
     for segment in text.split(|c: char| !c.is_alphanumeric()) {
@@ -775,7 +775,7 @@ fn is_cjk_unigram_char(c: char) -> bool {
 /// not sufficient evidence of lexical relevance. Multi-character tokens
 /// and non-CJK tokens, including single-character English words, remain
 /// eligible to contribute to the score.
-fn lexical_score(query_tokens: &HashSet<String>, content: &str) -> f32 {
+pub fn lexical_score(query_tokens: &HashSet<String>, content: &str) -> f32 {
     if query_tokens.is_empty() {
         return 0.0;
     }
