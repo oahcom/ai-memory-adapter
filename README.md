@@ -34,7 +34,7 @@ Developed by ChatGPT on remote server `43.138.133.238` following AI-STD-001 spec
 
 - **Language**: Rust 2021 edition
 - **Database**: SQLx + SQLite
-- **Vector DB**: Qdrant (default) / FAISS (optional)
+- **Vector DB**: none by default — SQLite is the only default backend; `qdrant` and `faiss-backend` are explicit opt-in Cargo features (`default = []`)
 - **Async Runtime**: Tokio
 
 ## Quick Start
