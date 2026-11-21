@@ -1,0 +1,559 @@
+//! Process-level integration tests for the JSON-over-stdio binary (T154-18).
+//!
+//! Every test spawns the real compiled executable and speaks to it through
+//! stdin/stdout. Nothing is mocked: the SQLite database is a real file on disk.
+
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
+
+use serde_json::Value;
+use uuid::Uuid;
+
+fn binary() -> &'static str {
+    env!("CARGO_BIN_EXE_memory-stdio")
+}
+
+fn database_path(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("ma-stdio-{label}-{}.sqlite3", Uuid::new_v4()))
+}
+
+struct Removal(PathBuf);
+
+impl Drop for Removal {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", self.0.display(), suffix));
+        }
+    }
+}
+
+struct Outcome {
+    stdout: String,
+    stderr: String,
+    code: i32,
+}
+
+fn invoke(db: &Path, input: &str) -> Outcome {
+    let mut command = Command::new(binary());
+    command
+        .arg("--db")
+        .arg(db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().expect("binary must start");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin piped")
+        .write_all(input.as_bytes())
+        .expect("request must be writable");
+    let output = child.wait_with_output().expect("binary must exit");
+
+    Outcome {
+        stdout: String::from_utf8(output.stdout).expect("stdout is UTF-8"),
+        stderr: String::from_utf8(output.stderr).expect("stderr is UTF-8"),
+        code: output.status.code().expect("exit code"),
+    }
+}
+
+/// Exactly one JSON response line, per contract §5.
+fn response(outcome: &Outcome) -> Value {
+    let lines: Vec<&str> = outcome
+        .stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "stdout must hold exactly one line: {:?}",
+        outcome.stdout
+    );
+    assert_eq!(
+        outcome.code, 0,
+        "protocol responses exit 0: {:?}",
+        outcome.stderr
+    );
+    serde_json::from_str(lines[0]).expect("response is valid JSON")
+}
+
+fn work_item() -> String {
+    format!("wi_{}", Uuid::new_v4())
+}
+
+fn store_request(request_id: &str, work_item: &str, session: &str, content: &str) -> String {
+    serde_json::json!({
+        "contract_version": "0.1",
+        "request_id": request_id,
+        "operation": "store",
+        "payload": {
+            "work_item_id": work_item,
+            "session_id": session,
+            "content": content,
+            "provenance": {
+                "source_type": "execution_result",
+                "source_id": session,
+                "captured_at": "2026-11-21T10:00:00Z"
+            },
+            "metadata": {"owner": "so"}
+        }
+    })
+    .to_string()
+}
+
+fn retrieve_request(request_id: &str, work_item: &str, session: Option<&str>) -> String {
+    let mut payload = serde_json::json!({
+        "work_item_id": work_item,
+        "query": "migration completed",
+        "limit": 10,
+        "threshold": 0.0
+    });
+    if let Some(session) = session {
+        payload["session_id"] = Value::String(session.to_owned());
+    }
+    serde_json::json!({
+        "contract_version": "0.1",
+        "request_id": request_id,
+        "operation": "retrieve",
+        "payload": payload
+    })
+    .to_string()
+}
+
+fn error_code(response: &Value) -> &str {
+    assert_eq!(response["ok"], Value::Bool(false), "{response}");
+    response["error"]["code"].as_str().expect("error code")
+}
+
+#[test]
+fn valid_store_returns_memory_id() {
+    let db = database_path("store");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    let response = response(&invoke(
+        &db,
+        &store_request(
+            "req_001",
+            &item,
+            "session-001",
+            "The migration was completed.",
+        ),
+    ));
+
+    assert_eq!(response["contract_version"], "0.1");
+    assert_eq!(response["request_id"], "req_001");
+    assert_eq!(response["ok"], Value::Bool(true));
+    let memory_id = response["result"]["memory_id"].as_str().expect("memory_id");
+    assert!(
+        Uuid::parse_str(memory_id).is_ok(),
+        "memory_id is a UUID: {memory_id}"
+    );
+}
+
+#[test]
+fn valid_retrieve_returns_stored_entry_with_provenance() {
+    let db = database_path("retrieve");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    invoke(
+        &db,
+        &store_request(
+            "req_001",
+            &item,
+            "session-001",
+            "The migration was completed.",
+        ),
+    );
+
+    let response = response(&invoke(&db, &retrieve_request("req_002", &item, None)));
+
+    assert_eq!(response["ok"], Value::Bool(true));
+    let entries = response["result"]["entries"]
+        .as_array()
+        .expect("entries array");
+    assert_eq!(
+        entries.len(),
+        1,
+        "cross-session retrieval inside one WorkItem: {response}"
+    );
+    let entry = &entries[0];
+    assert_eq!(entry["work_item_id"], item.as_str());
+    assert_eq!(entry["session_id"], "session-001");
+    assert_eq!(entry["content"], "The migration was completed.");
+    assert_eq!(entry["provenance"]["source_type"], "execution_result");
+    assert_eq!(entry["provenance"]["source_id"], "session-001");
+    assert_eq!(entry["provenance"]["captured_at"], "2026-11-21T10:00:00Z");
+    assert!(entry["created_at"]
+        .as_str()
+        .is_some_and(|v| v.ends_with('Z')));
+    assert!(entry["score"].as_f64().is_some_and(|score| score > 0.0));
+    assert_eq!(response["result"]["entries_included"], 1);
+    assert_eq!(response["result"]["entries_omitted"], 0);
+}
+
+#[test]
+fn unknown_contract_version_is_rejected() {
+    let db = database_path("version");
+    let _cleanup = Removal(db.clone());
+
+    let request = serde_json::json!({
+        "contract_version": "9.9",
+        "request_id": "req_003",
+        "operation": "retrieve",
+        "payload": {"work_item_id": work_item(), "query": "x"}
+    });
+    let response = response(&invoke(&db, &request.to_string()));
+
+    assert_eq!(error_code(&response), "UNSUPPORTED_VERSION");
+    assert_eq!(response["request_id"], "req_003");
+}
+
+#[test]
+fn invalid_operation_is_rejected() {
+    let db = database_path("operation");
+    let _cleanup = Removal(db.clone());
+
+    let request = serde_json::json!({
+        "contract_version": "0.1",
+        "request_id": "req_004",
+        "operation": "delete",
+        "payload": {"work_item_id": work_item()}
+    });
+    let response = response(&invoke(&db, &request.to_string()));
+
+    assert_eq!(error_code(&response), "INVALID_OPERATION");
+}
+
+#[test]
+fn invalid_identifier_is_rejected() {
+    let db = database_path("id");
+    let _cleanup = Removal(db.clone());
+
+    for bad in [
+        "wi_not-a-uuid",
+        "550e8400-e29b-41d4-a716-446655440000",
+        "wi_",
+    ] {
+        let response = response(&invoke(
+            &db,
+            &store_request("req_005", bad, "session-001", "content"),
+        ));
+        assert_eq!(error_code(&response), "INVALID_ID", "identifier {bad}");
+    }
+}
+
+#[test]
+fn missing_work_item_scope_is_rejected() {
+    let db = database_path("scope");
+    let _cleanup = Removal(db.clone());
+
+    let request = serde_json::json!({
+        "contract_version": "0.1",
+        "request_id": "req_006",
+        "operation": "retrieve",
+        "payload": {"session_id": "session-001", "query": "migration"}
+    });
+    let response = response(&invoke(&db, &request.to_string()));
+
+    assert_eq!(error_code(&response), "INVALID_SCOPE");
+}
+
+#[test]
+fn invalid_provenance_is_rejected() {
+    let db = database_path("provenance");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    let cases = [
+        serde_json::json!({}),
+        serde_json::json!({"source_type": "guess", "source_id": "s", "captured_at": "2026-11-21T10:00:00Z"}),
+        serde_json::json!({"source_type": "conversation", "source_id": "", "captured_at": "2026-11-21T10:00:00Z"}),
+        serde_json::json!({"source_type": "conversation", "source_id": "s", "captured_at": "yesterday"}),
+    ];
+
+    for provenance in cases {
+        let request = serde_json::json!({
+            "contract_version": "0.1",
+            "request_id": "req_007",
+            "operation": "store",
+            "payload": {
+                "work_item_id": item,
+                "session_id": "session-001",
+                "content": "content",
+                "provenance": provenance
+            }
+        });
+        let response = response(&invoke(&db, &request.to_string()));
+        assert_eq!(error_code(&response), "INVALID_PROVENANCE", "{provenance}");
+    }
+}
+
+#[test]
+fn session_filter_narrows_retrieval_within_one_work_item() {
+    let db = database_path("session-filter");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    invoke(
+        &db,
+        &store_request("req_a", &item, "session-a", "migration completed alpha"),
+    );
+    invoke(
+        &db,
+        &store_request("req_b", &item, "session-b", "migration completed beta"),
+    );
+
+    // Absent session_id: both Sessions inside the WorkItem are visible.
+    let all = response(&invoke(&db, &retrieve_request("req_all", &item, None)));
+    assert_eq!(all["result"]["entries"].as_array().map(Vec::len), Some(2));
+
+    // Present session_id: narrowed to that Session only.
+    let filtered = response(&invoke(
+        &db,
+        &retrieve_request("req_one", &item, Some("session-b")),
+    ));
+    let entries = filtered["result"]["entries"]
+        .as_array()
+        .expect("entries array");
+    assert_eq!(entries.len(), 1, "session filter must narrow: {filtered}");
+    assert_eq!(entries[0]["session_id"], "session-b");
+    assert_eq!(entries[0]["content"], "migration completed beta");
+    assert_eq!(entries[0]["work_item_id"], item.as_str());
+}
+
+#[test]
+fn cross_work_item_entries_are_never_returned() {
+    let db = database_path("isolation");
+    let _cleanup = Removal(db.clone());
+    let (first, second) = (work_item(), work_item());
+
+    invoke(
+        &db,
+        &store_request("req_a", &first, "session-a", "migration completed alpha"),
+    );
+    invoke(
+        &db,
+        &store_request("req_b", &second, "session-b", "migration completed beta"),
+    );
+
+    let response = response(&invoke(&db, &retrieve_request("req_c", &first, None)));
+
+    assert_eq!(response["ok"], Value::Bool(true));
+    let entries = response["result"]["entries"]
+        .as_array()
+        .expect("entries array");
+    assert_eq!(
+        entries.len(),
+        1,
+        "only the first WorkItem may match: {response}"
+    );
+    assert_eq!(entries[0]["work_item_id"], first.as_str());
+    assert_eq!(entries[0]["content"], "migration completed alpha");
+}
+
+#[test]
+fn entries_survive_process_restart() {
+    let db = database_path("restart");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    let stored = response(&invoke(
+        &db,
+        &store_request(
+            "req_001",
+            &item,
+            "session-001",
+            "migration completed durably",
+        ),
+    ));
+    let memory_id = stored["result"]["memory_id"]
+        .as_str()
+        .expect("memory_id")
+        .to_owned();
+
+    // Second process, same database file: proves the commit reached disk.
+    let response = response(&invoke(&db, &retrieve_request("req_002", &item, None)));
+
+    let entries = response["result"]["entries"]
+        .as_array()
+        .expect("entries array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["memory_id"], memory_id.as_str());
+    assert_eq!(entries[0]["content"], "migration completed durably");
+}
+
+#[test]
+fn stdout_and_stderr_stay_separated() {
+    let db = database_path("streams");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    let outcome = invoke(
+        &db,
+        &store_request("req_001", &item, "session-001", "migration completed"),
+    );
+
+    let parsed = response(&outcome);
+    assert_eq!(parsed["ok"], Value::Bool(true));
+    assert!(
+        !outcome.stdout.contains("memory-stdio:"),
+        "diagnostics must not reach stdout: {:?}",
+        outcome.stdout
+    );
+    assert!(
+        !outcome.stderr.contains("contract_version"),
+        "protocol data must not reach stderr: {:?}",
+        outcome.stderr
+    );
+    assert!(
+        outcome.stdout.lines().count() == 1,
+        "stdout must contain exactly one response line"
+    );
+}
+
+#[test]
+fn malformed_json_is_rejected_without_panicking() {
+    let db = database_path("malformed");
+    let _cleanup = Removal(db.clone());
+
+    for bad in [
+        "{not json",
+        "[]",
+        "\"a string\"",
+        "{\"contract_version\":\"0.1\"}",
+    ] {
+        let outcome = invoke(&db, bad);
+        let parsed = response(&outcome);
+        assert_eq!(error_code(&parsed), "INVALID_REQUEST", "input {bad}");
+        assert_eq!(outcome.code, 0);
+    }
+}
+
+#[test]
+fn storage_failure_is_reported_as_storage_error() {
+    let root = std::env::temp_dir().join(format!("ma-stdio-missing-{}", Uuid::new_v4()));
+    let db = root.join("absent").join("memory.sqlite3");
+    let _cleanup = Removal(root);
+
+    let response = response(&invoke(
+        &db,
+        &store_request(
+            "req_001",
+            &work_item(),
+            "session-001",
+            "migration completed",
+        ),
+    ));
+
+    assert_eq!(error_code(&response), "STORAGE_ERROR");
+    assert_eq!(response["error"]["retryable"], Value::Bool(false));
+}
+
+/// Spawns the binary, feeds stdin, and tolerates the process exiting before the
+/// write lands (EPIPE): startup-failure cases legitimately exit before reading.
+fn invoke_raw(db_arg: Option<&str>, input: &str) -> Outcome {
+    let mut command = Command::new(binary());
+    if let Some(db) = db_arg {
+        command.arg("--db").arg(db);
+    }
+    command
+        .env_remove("MA_SQLITE_PATH")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().expect("binary must start");
+    let _ = child
+        .stdin
+        .as_mut()
+        .expect("stdin piped")
+        .write_all(input.as_bytes());
+    let output = child.wait_with_output().expect("binary must exit");
+
+    Outcome {
+        stdout: String::from_utf8(output.stdout).expect("stdout is UTF-8"),
+        stderr: String::from_utf8(output.stderr).expect("stderr is UTF-8"),
+        code: output.status.code().expect("exit code"),
+    }
+}
+
+#[test]
+fn missing_database_path_aborts_without_protocol_output() {
+    let outcome = invoke_raw(None, "{\"contract_version\":\"0.1\"}\n");
+
+    assert_eq!(outcome.code, 2, "startup failure exit code");
+    assert!(
+        outcome.stdout.is_empty(),
+        "no protocol output without a database"
+    );
+    assert!(
+        outcome.stderr.contains("--db"),
+        "stderr must explain the missing configuration"
+    );
+}
+
+#[test]
+fn relative_database_path_is_rejected() {
+    let outcome = invoke_raw(Some("relative/memory.sqlite3"), "{}\n");
+
+    assert_eq!(outcome.code, 2);
+    assert!(outcome.stdout.is_empty());
+    assert!(
+        outcome.stderr.contains("absolute"),
+        "stderr must state the absolute-path requirement"
+    );
+}
+
+#[test]
+fn empty_retrieval_is_a_successful_result() {
+    let db = database_path("empty");
+    let _cleanup = Removal(db.clone());
+
+    let response = response(&invoke(
+        &db,
+        &retrieve_request("req_001", &work_item(), None),
+    ));
+
+    assert_eq!(response["ok"], Value::Bool(true));
+    assert_eq!(
+        response["result"]["entries"].as_array().map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(response["result"]["entries_included"], 0);
+}
+
+#[test]
+fn multiple_requests_in_one_process_produce_one_response_each() {
+    let db = database_path("batch");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    let input = format!(
+        "{}\n{}\n",
+        store_request("req_001", &item, "session-001", "migration completed"),
+        retrieve_request("req_002", &item, None)
+    );
+    let outcome = invoke(&db, &input);
+
+    let responses: Vec<Value> = outcome
+        .stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("each line is JSON"))
+        .collect();
+    assert_eq!(responses.len(), 2, "one response per request line");
+    assert_eq!(responses[0]["request_id"], "req_001");
+    assert_eq!(responses[1]["request_id"], "req_002");
+    assert_eq!(
+        responses[1]["result"]["entries"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(outcome.code, 0);
+}
