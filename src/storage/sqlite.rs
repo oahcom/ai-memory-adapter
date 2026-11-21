@@ -30,6 +30,92 @@ pub struct SqliteStorage {
     pool: SqlitePool,
 }
 
+struct MigrationFailure {
+    stage: &'static str,
+    error: AdapterError,
+    sqlite_error_code: Option<String>,
+}
+
+impl MigrationFailure {
+    fn from_sqlx(stage: &'static str, error: sqlx::Error) -> Self {
+        let sqlite_error_code = error
+            .as_database_error()
+            .and_then(|database_error| database_error.code())
+            .map(|code| code.to_string());
+
+        Self {
+            stage,
+            error: storage_error(error),
+            sqlite_error_code,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_hook(stage: &'static str, error: String) -> Self {
+        Self {
+            stage,
+            error: AdapterError::Storage(format!("test schema hook injected failure: {error}")),
+            sqlite_error_code: None,
+        }
+    }
+}
+
+fn record_migration_started(migration_id: &str) {
+    tracing::info!(
+        target: "ai_memory_adapter::schema_migration",
+        event = "started",
+        migration_id = %migration_id
+    );
+    #[cfg(any(test, feature = "test-support"))]
+    crate::test_support::record_schema_migration_event(
+        crate::test_support::SchemaMigrationEvent::Started {
+            migration_id: migration_id.to_owned(),
+        },
+    );
+}
+
+fn record_migration_committed(migration_id: &str) {
+    tracing::info!(
+        target: "ai_memory_adapter::schema_migration",
+        event = "committed",
+        migration_id = %migration_id
+    );
+    #[cfg(any(test, feature = "test-support"))]
+    crate::test_support::record_schema_migration_event(
+        crate::test_support::SchemaMigrationEvent::Committed {
+            migration_id: migration_id.to_owned(),
+        },
+    );
+}
+
+fn record_migration_failed(
+    migration_id: &str,
+    failure_stage: &'static str,
+    error: &AdapterError,
+    sqlite_error_code: Option<String>,
+    rollback_succeeded: Option<bool>,
+) {
+    tracing::error!(
+        target: "ai_memory_adapter::schema_migration",
+        event = "failed",
+        migration_id = %migration_id,
+        failure_stage,
+        error = %error,
+        sqlite_error_code = ?sqlite_error_code,
+        rollback_succeeded = ?rollback_succeeded
+    );
+    #[cfg(any(test, feature = "test-support"))]
+    crate::test_support::record_schema_migration_event(
+        crate::test_support::SchemaMigrationEvent::Failed {
+            migration_id: migration_id.to_owned(),
+            failure_stage,
+            error: error.to_string(),
+            sqlite_error_code,
+            rollback_succeeded,
+        },
+    );
+}
+
 // Serialize schema creation and migration across independent processes. BEGIN IMMEDIATE
 // acquires SQLite's reserved write lock before inspecting the schema, so a second
 // opener re-checks the column only after the first migration has committed.
@@ -40,7 +126,12 @@ async fn initialize_schema(pool: &SqlitePool) -> AdapterResult<()> {
         .await
         .map_err(storage_error)?;
 
-    let migration = async {
+    // The migration ID correlates the three lifecycle events for this attempt.
+    let migration_id = Uuid::new_v4().to_string();
+    record_migration_started(&migration_id);
+
+    let mut failure_stage = "create_memories_table";
+    let migration: Result<(), MigrationFailure> = async {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY NOT NULL,
@@ -56,91 +147,121 @@ async fn initialize_schema(pool: &SqlitePool) -> AdapterResult<()> {
         )
         .execute(&mut *connection)
         .await
-        .map_err(storage_error)?;
+        .map_err(|error| MigrationFailure::from_sqlx(failure_stage, error))?;
 
         // This check intentionally happens after BEGIN IMMEDIATE. Another process
         // may have migrated while this connection was waiting for the write lock.
+        failure_stage = "inspect_memories_columns";
         let columns = sqlx::query("PRAGMA table_info(memories)")
             .fetch_all(&mut *connection)
             .await
-            .map_err(storage_error)?;
+            .map_err(|error| MigrationFailure::from_sqlx(failure_stage, error))?;
         let has_work_item_id = columns
             .iter()
             .any(|row| row.get::<String, _>("name") == "work_item_id");
         if !has_work_item_id {
+            failure_stage = "alter_add_work_item_id";
             sqlx::query("ALTER TABLE memories ADD COLUMN work_item_id TEXT")
                 .execute(&mut *connection)
                 .await
-                .map_err(storage_error)?;
+                .map_err(|error| MigrationFailure::from_sqlx(failure_stage, error))?;
             #[cfg(test)]
             {
                 if let Some(hook) = crate::test_support::schema_migration_hook() {
-                    hook("after_alter_work_item_id").map_err(|e| {
-                        AdapterError::Storage(format!("test schema hook injected failure: {e}"))
-                    })?;
+                    hook("after_alter_work_item_id")
+                        .map_err(|e| MigrationFailure::from_hook("after_alter_work_item_id", e))?;
                 }
             }
         }
 
+        failure_stage = "create_work_item_index";
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_memories_work_item_last_accessed_id ON memories(work_item_id, last_accessed DESC, id DESC)")
             .execute(&mut *connection)
             .await
-            .map_err(storage_error)?;
+            .map_err(|error| MigrationFailure::from_sqlx(failure_stage, error))?;
         #[cfg(test)]
         {
+            failure_stage = "inspect_created_indexes";
             let indexes = sqlx::query("PRAGMA index_list(memories)")
                 .fetch_all(&mut *connection)
                 .await
-                .map_err(storage_error)?;
+                .map_err(|error| MigrationFailure::from_sqlx(failure_stage, error))?;
             let first_index_exists = indexes
                 .iter()
                 .any(|row| row.get::<String, _>("name") == "idx_memories_work_item_last_accessed_id");
             if let Some(hook) = crate::test_support::schema_migration_index_hook() {
                 hook("after_first_index_created", first_index_exists).map_err(|e| {
-                    AdapterError::Storage(format!("test schema hook injected failure: {e}"))
+                    MigrationFailure::from_hook("after_first_index_created", e)
                 })?;
             }
         }
+        failure_stage = "create_session_created_index";
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_memories_session_created
              ON memories(session_id, created_at DESC)",
         )
         .execute(&mut *connection)
         .await
-        .map_err(storage_error)?;
+        .map_err(|error| MigrationFailure::from_sqlx(failure_stage, error))?;
+        failure_stage = "create_created_index";
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at)")
             .execute(&mut *connection)
             .await
-            .map_err(storage_error)?;
+            .map_err(|error| MigrationFailure::from_sqlx(failure_stage, error))?;
+        failure_stage = "create_session_last_accessed_index";
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_memories_session_last_accessed_id
              ON memories(session_id, last_accessed DESC, id DESC)",
         )
         .execute(&mut *connection)
         .await
-        .map_err(storage_error)?;
+        .map_err(|error| MigrationFailure::from_sqlx(failure_stage, error))?;
+        failure_stage = "create_last_accessed_index";
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_memories_last_accessed_id
              ON memories(last_accessed DESC, id DESC)",
         )
         .execute(&mut *connection)
         .await
-        .map_err(storage_error)?;
-        Ok::<(), AdapterError>(())
+        .map_err(|error| MigrationFailure::from_sqlx(failure_stage, error))?;
+        Ok(())
     }
     .await;
 
     match migration {
         Ok(()) => {
-            sqlx::query("COMMIT")
-                .execute(&mut *connection)
-                .await
-                .map_err(storage_error)?;
+            if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                let failure = MigrationFailure::from_sqlx("commit", error);
+                // Preserve existing behavior: a failed COMMIT is returned
+                // directly; do not add a ROLLBACK attempt here.
+                record_migration_failed(
+                    &migration_id,
+                    failure.stage,
+                    &failure.error,
+                    failure.sqlite_error_code,
+                    None,
+                );
+                return Err(failure.error);
+            }
+            record_migration_committed(&migration_id);
             Ok(())
         }
         Err(error) => {
-            let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
-            Err(error)
+            // SQLx 0.8.6 is_in_transaction() does not observe a transaction
+            // started through raw SQL BEGIN IMMEDIATE. Do not report it as
+            // SQLite transaction state; record only the actual ROLLBACK result.
+            let rollback_succeeded = sqlx::query("ROLLBACK")
+                .execute(&mut *connection)
+                .await
+                .is_ok();
+            record_migration_failed(
+                &migration_id,
+                error.stage,
+                &error.error,
+                error.sqlite_error_code,
+                Some(rollback_succeeded),
+            );
+            Err(error.error)
         }
     }
 }
@@ -2295,6 +2416,175 @@ mod tests {
         assert!(context.contains("scoped index migration probe"));
 
         drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    #[ignore = "global lifecycle observer; run with --ignored --test-threads=1"]
+    async fn schema_migration_lifecycle_records_started_then_committed() {
+        use crate::test_support::{take_schema_migration_events, SchemaMigrationEvent};
+
+        let _ = take_schema_migration_events();
+        let path = std::env::temp_dir().join(format!(
+            "unit-test-migration-lifecycle-success-{}.db",
+            Uuid::new_v4()
+        ));
+
+        let storage = SqliteStorage::open(&path)
+            .await
+            .expect("schema migration must succeed");
+
+        let events = take_schema_migration_events();
+        assert_eq!(events.len(), 2, "expected exactly two lifecycle events");
+
+        let migration_id = match &events[0] {
+            SchemaMigrationEvent::Started { migration_id } => migration_id.clone(),
+            event => panic!("first event must be Started, got {event:?}"),
+        };
+
+        assert_eq!(
+            events[1],
+            SchemaMigrationEvent::Committed { migration_id },
+            "successful migration must emit Committed after Started"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    #[ignore = "global lifecycle observer and hook; run with --ignored --test-threads=1"]
+    async fn schema_migration_lifecycle_records_failure_and_rollback_result() {
+        use crate::test_support::{take_schema_migration_events, SchemaMigrationEvent};
+
+        let _ = take_schema_migration_events();
+        let path = std::env::temp_dir().join(format!(
+            "unit-test-migration-lifecycle-hook-failure-{}.db",
+            Uuid::new_v4()
+        ));
+
+        const FAILURE: &str = "R3_LIFECYCLE_INJECTED_FAILURE";
+        let guard = crate::test_support::set_schema_migration_index_hook(Arc::new(
+            |stage, first_index_exists| {
+                assert_eq!(stage, "after_first_index_created");
+                assert!(
+                    first_index_exists,
+                    "the first index must exist before injecting the failure"
+                );
+                Err(FAILURE.to_string())
+            },
+        ));
+
+        let result = SqliteStorage::open(&path).await;
+        assert!(
+            result.is_err(),
+            "open must return an error after injected migration failure"
+        );
+        drop(guard);
+
+        let events = take_schema_migration_events();
+        assert_eq!(events.len(), 2, "expected Started followed by Failed");
+
+        let migration_id = match &events[0] {
+            SchemaMigrationEvent::Started { migration_id } => migration_id.clone(),
+            event => panic!("first event must be Started, got {event:?}"),
+        };
+
+        match &events[1] {
+            SchemaMigrationEvent::Failed {
+                migration_id: failed_id,
+                failure_stage,
+                error,
+                sqlite_error_code,
+                rollback_succeeded,
+            } => {
+                assert_eq!(failed_id, &migration_id);
+                assert_eq!(*failure_stage, "after_first_index_created");
+                assert!(error.contains(FAILURE), "failure detail must be preserved");
+                assert_eq!(*sqlite_error_code, None);
+                assert_eq!(*rollback_succeeded, Some(true));
+            }
+            event => panic!("second event must be Failed, got {event:?}"),
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    #[ignore = "global lifecycle observer; run with --ignored --test-threads=1"]
+    async fn schema_migration_lifecycle_preserves_real_sqlite_error_code() {
+        use crate::test_support::{take_schema_migration_events, SchemaMigrationEvent};
+
+        let _ = take_schema_migration_events();
+        let path = std::env::temp_dir().join(format!(
+            "unit-test-migration-lifecycle-sqlite-error-{}.db",
+            Uuid::new_v4()
+        ));
+
+        // This deliberately malformed legacy table already has work_item_id,
+        // so migration reaches CREATE INDEX and SQLite reports the missing
+        // last_accessed column as a real database error.
+        let setup_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "CREATE TABLE memories (
+                id TEXT PRIMARY KEY NOT NULL,
+                session_id TEXT NOT NULL,
+                work_item_id TEXT,
+                content TEXT NOT NULL,
+                embedding_json TEXT,
+                metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                access_count INTEGER NOT NULL CHECK (access_count >= 0)
+            )",
+        )
+        .execute(&setup_pool)
+        .await
+        .unwrap();
+        setup_pool.close().await;
+
+        let result = SqliteStorage::open(&path).await;
+        assert!(
+            result.is_err(),
+            "migration must fail when CREATE INDEX references a missing column"
+        );
+
+        let events = take_schema_migration_events();
+        assert_eq!(events.len(), 2, "expected Started followed by Failed");
+
+        let migration_id = match &events[0] {
+            SchemaMigrationEvent::Started { migration_id } => migration_id.clone(),
+            event => panic!("first event must be Started, got {event:?}"),
+        };
+
+        match &events[1] {
+            SchemaMigrationEvent::Failed {
+                migration_id: failed_id,
+                failure_stage,
+                sqlite_error_code,
+                rollback_succeeded,
+                ..
+            } => {
+                assert_eq!(failed_id, &migration_id);
+                assert_eq!(*failure_stage, "create_work_item_index");
+                assert_eq!(
+                    sqlite_error_code.as_deref(),
+                    Some("1"),
+                    "SQLite SQLITE_ERROR code must be preserved from sqlx::Error"
+                );
+                assert_eq!(*rollback_succeeded, Some(true));
+            }
+            event => panic!("second event must be Failed, got {event:?}"),
+        }
+
         let _ = std::fs::remove_file(path);
     }
 }

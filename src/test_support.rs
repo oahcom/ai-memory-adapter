@@ -5,6 +5,42 @@
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SchemaMigrationEvent {
+    Started {
+        migration_id: String,
+    },
+    Committed {
+        migration_id: String,
+    },
+    Failed {
+        migration_id: String,
+        failure_stage: &'static str,
+        error: String,
+        sqlite_error_code: Option<String>,
+        rollback_succeeded: Option<bool>,
+    },
+}
+
+static SCHEMA_MIGRATION_EVENTS: Mutex<Vec<SchemaMigrationEvent>> = Mutex::new(Vec::new());
+
+pub(crate) fn record_schema_migration_event(event: SchemaMigrationEvent) {
+    SCHEMA_MIGRATION_EVENTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(event);
+}
+
+/// Drain the recorded migration lifecycle events.
+/// Tests using this global observer must run serially.
+pub(crate) fn take_schema_migration_events() -> Vec<SchemaMigrationEvent> {
+    std::mem::take(
+        &mut *SCHEMA_MIGRATION_EVENTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    )
+}
+
 type PruneHook = Arc<dyn Fn(usize) -> Result<(), String> + Send + Sync>;
 
 static PRUNE_TEST_HOOK: Mutex<Option<PruneHook>> = Mutex::new(None);
