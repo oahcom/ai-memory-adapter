@@ -233,10 +233,6 @@ impl MemoryAdapter for OutOfScopeAdapter {
     async fn inject_context(&self, _session_id: &str) -> AdapterResult<String> {
         unreachable!("inject_context is not used by this test")
     }
-
-    async fn prune(&self, _before: chrono::DateTime<Utc>) -> AdapterResult<usize> {
-        unreachable!("prune is not used by this test")
-    }
 }
 
 #[tokio::test]

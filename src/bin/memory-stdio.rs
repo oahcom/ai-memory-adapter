@@ -156,9 +156,16 @@ fn error_response(request_id: &str, failure: &Failure) -> Value {
         "error": {
             "code": failure.code,
             "message": failure.message,
-            "retryable": false,
+            "retryable": is_retryable(failure.code),
         },
     })
+}
+
+/// Contract §11: retryability follows the actual error condition, not a blanket
+/// rule. Only transient transport failures are retryable; a storage error is not
+/// automatically retryable.
+fn is_retryable(code: &str) -> bool {
+    matches!(code, "ADAPTER_UNAVAILABLE" | "ADAPTER_TIMEOUT")
 }
 
 async fn handle(request: Value, db_path: &str, storage: &mut Option<SqliteStorage>) -> Value {
@@ -524,4 +531,33 @@ async fn open_storage<'a>(
 
 fn storage_failure(error: AdapterError) -> Failure {
     Failure::new("STORAGE_ERROR", error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_is_decided_per_error_code() {
+        assert!(is_retryable("ADAPTER_UNAVAILABLE"));
+        assert!(is_retryable("ADAPTER_TIMEOUT"));
+        for code in [
+            "ADAPTER_CRASHED",
+            "STORAGE_ERROR",
+            "INVALID_REQUEST",
+            "INVALID_SCOPE",
+            "SCOPE_VIOLATION",
+            "INTERNAL_ERROR",
+        ] {
+            assert!(!is_retryable(code), "{code} must not be retryable");
+        }
+    }
+
+    #[test]
+    fn error_envelope_carries_condition_derived_retryable() {
+        let transient = error_response("r1", &Failure::new("ADAPTER_TIMEOUT", "slow"));
+        assert_eq!(transient["error"]["retryable"], Value::Bool(true));
+        let permanent = error_response("r1", &Failure::new("STORAGE_ERROR", "disk"));
+        assert_eq!(permanent["error"]["retryable"], Value::Bool(false));
+    }
 }

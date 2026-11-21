@@ -7,7 +7,6 @@ pub use error::{AdapterError, AdapterResult};
 pub use models::{MemoryEntry, Query};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 /// Unified asynchronous memory adapter.
@@ -21,6 +20,4 @@ pub trait MemoryAdapter: Send + Sync {
     async fn query(&self, query: &Query) -> AdapterResult<Vec<MemoryEntry>>;
     /// Build context for a session.
     async fn inject_context(&self, session_id: &str) -> AdapterResult<String>;
-    /// Prune memories before a timestamp.
-    async fn prune(&self, before: DateTime<Utc>) -> AdapterResult<usize>;
 }

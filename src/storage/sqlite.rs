@@ -11,7 +11,6 @@ use uuid::Uuid;
 
 use crate::adapter::{AdapterError, AdapterResult, MemoryAdapter, MemoryEntry, Query};
 use crate::context::injector::escape_context_content;
-use crate::pruning::{EbbinghausPolicy, PruneReport};
 
 /// SQLite implementation of MemoryAdapter.
 /// Maximum number of candidate records fetched from the database for scoring.
@@ -21,10 +20,6 @@ use crate::pruning::{EbbinghausPolicy, PruneReport};
 /// Note: this bounds fetched/scored rows, not necessarily database rows examined;
 /// the composite indexes ensure the database can serve the bounded query efficiently.
 pub const MAX_QUERY_CANDIDATES: usize = 1000;
-
-/// Number of records processed per batch in Ebbinghaus pruning.
-/// Each batch runs in its own short transaction to avoid long-running locks.
-pub const PRUNE_BATCH_SIZE: usize = 256;
 
 pub struct SqliteStorage {
     pool: SqlitePool,
@@ -230,180 +225,6 @@ impl SqliteStorage {
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
-    }
-
-    /// Prune memories using an Ebbinghaus retention policy with batched processing.
-    ///
-    /// Uses keyset pagination over the primary key to process records in bounded
-    /// batches (PRUNE_BATCH_SIZE per batch). Each batch runs in its own short
-    /// transaction. DELETE includes optimistic concurrency checks on
-    /// `last_accessed` and `access_count` to avoid deleting records whose
-    /// access metadata changed since they were read. Note: this protects
-    /// access-state modifications (query/inject_context calls), not arbitrary
-    /// field changes like content or metadata.
-    ///
-    /// **Important semantics:** This is NOT atomic across batches. If an error
-    /// occurs mid-run, previously committed batches remain committed (NOT rolled back).
-    /// The
-    /// function returns an error (not a partial success count). Retries are safe:
-    /// already-deleted records are simply not found again.
-    ///
-    /// # PruneReport Accounting Semantics
-    ///
-    /// - `entries_examined`: Total records read from the database across all batches.
-    /// - `entries_deleted`: Records where the conditional DELETE affected exactly 1 row.
-    /// - `entries_retained`: Records that were evaluated and determined to NOT need pruning.
-    /// - **Skipped records**: If a conditional DELETE affects 0 rows (record was concurrently
-    ///   modified between SELECT and DELETE), the record is counted in `entries_examined`
-    ///   but in NEITHER `entries_deleted` NOR `entries_retained`. This means:
-    ///   `entries_examined >= entries_deleted + entries_retained` (equality holds only
-    ///   when no concurrent modifications occur).
-    pub async fn prune_ebbinghaus(
-        &self,
-        policy: &EbbinghausPolicy,
-        evaluated_at: DateTime<Utc>,
-    ) -> AdapterResult<PruneReport> {
-        policy.validate()?;
-
-        // Read the max ID as scan upper bound to provide a finite scan boundary.
-        // Note: UUID identifiers are not monotonic, so a record inserted during
-        // pruning with an ID between the cursor and upper bound may still be
-        // included. The upper bound prevents unbounded scan growth but does not
-        // guarantee a consistent snapshot of the original record set.
-        let upper_bound: Option<String> = sqlx::query("SELECT MAX(id) FROM memories")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(storage_error)?
-            .get(0);
-
-        let upper_bound = match upper_bound {
-            Some(id) => id,
-            None => {
-                // Empty table
-                return Ok(PruneReport {
-                    entries_examined: 0,
-                    entries_deleted: 0,
-                    entries_retained: 0,
-                    prune_threshold: policy.prune_threshold,
-                    evaluated_at,
-                });
-            }
-        };
-
-        let mut report = PruneReport {
-            entries_examined: 0,
-            entries_deleted: 0,
-            entries_retained: 0,
-            prune_threshold: policy.prune_threshold,
-            evaluated_at,
-        };
-
-        let mut last_seen_id = String::new(); // empty string sorts before all UUIDs
-        #[cfg(test)]
-        let mut successful_delete_ordinal = 0usize;
-
-        loop {
-            // Fetch one batch using keyset pagination.
-            let rows = sqlx::query(
-                "SELECT id, session_id, work_item_id, content, embedding_json, metadata_json,
-                        created_at, access_count, last_accessed
-                 FROM memories
-                 WHERE id > ? AND id <= ?
-                 ORDER BY id ASC
-                 LIMIT ?",
-            )
-            .bind(&last_seen_id)
-            .bind(&upper_bound)
-            .bind(PRUNE_BATCH_SIZE as i64)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(storage_error)?;
-
-            if rows.is_empty() {
-                break;
-            }
-
-            let batch_len = rows.len();
-            report.entries_examined += batch_len;
-
-            // Advance the cursor before processing so the current invocation
-            // does not revisit already-fetched rows. The cursor is in-memory
-            // only; if this invocation fails, a subsequent prune call starts
-            // scanning from the beginning. Previously committed deletions
-            // remain absent, while uncommitted records are re-evaluated.
-            let last_row_id: String = rows[batch_len - 1].get("id");
-            last_seen_id = last_row_id;
-
-            // Test-only hook: called after SELECT, before DELETE
-            #[cfg(test)]
-            {
-                if let Some(hook) = crate::test_support::prune_hook() {
-                    hook(batch_len).map_err(|e| {
-                        AdapterError::Storage(format!("test hook injected failure: {e}"))
-                    })?;
-                }
-            }
-
-            // Collect IDs to delete with their read-time state for optimistic check.
-            let mut to_delete: Vec<(String, String, i32)> = Vec::new(); // (id, last_accessed, access_count)
-
-            for row in &rows {
-                let entry = decode_entry(row)?;
-
-                if policy.should_prune(&entry, evaluated_at)? {
-                    to_delete.push((
-                        entry.id.to_string(),
-                        entry
-                            .last_accessed
-                            .to_rfc3339_opts(SecondsFormat::Nanos, true),
-                        entry.access_count,
-                    ));
-                } else {
-                    report.entries_retained += 1;
-                }
-            }
-
-            // Process deletions in a short per-batch transaction.
-            if !to_delete.is_empty() {
-                let mut tx = self.pool.begin().await.map_err(storage_error)?;
-
-                for (id, read_last_accessed, read_access_count) in &to_delete {
-                    // Optimistic concurrency: only delete if the record has not
-                    // changed since we read it. If it was concurrently updated
-                    // (e.g. access_count incremented), skip it this round.
-                    let result = sqlx::query(
-                        "DELETE FROM memories WHERE id = ? AND last_accessed = ? AND access_count = ?",
-                    )
-                    .bind(id)
-                    .bind(read_last_accessed)
-                    .bind(read_access_count)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(storage_error)?;
-
-                    if result.rows_affected() == 1 {
-                        report.entries_deleted += 1;
-                        #[cfg(test)]
-                        {
-                            successful_delete_ordinal += 1;
-                            if let Some(hook) = crate::test_support::prune_delete_hook() {
-                                hook(successful_delete_ordinal).map_err(|e| {
-                                    AdapterError::Storage(format!(
-                                        "test DELETE hook injected failure: {e}"
-                                    ))
-                                })?;
-                            }
-                        }
-                    }
-                    // rows_affected == 0 means record was concurrently modified;
-                    // skip it (will be re-evaluated in a future prune run).
-                }
-
-                tx.commit().await.map_err(storage_error)?;
-            }
-        }
-
-        Ok(report)
     }
 }
 
@@ -616,15 +437,6 @@ impl MemoryAdapter for SqliteStorage {
 
         Ok(context)
     }
-
-    async fn prune(&self, before: DateTime<Utc>) -> AdapterResult<usize> {
-        let result = sqlx::query("DELETE FROM memories WHERE created_at < ?")
-            .bind(before.to_rfc3339_opts(SecondsFormat::Nanos, true))
-            .execute(&self.pool)
-            .await
-            .map_err(storage_error)?;
-        Ok(result.rows_affected() as usize)
-    }
 }
 
 fn storage_error(error: impl std::fmt::Display) -> AdapterError {
@@ -825,10 +637,7 @@ fn is_sqlite_busy_code(code: Option<&str>) -> bool {
 mod tests {
     use super::*;
     use crate::adapter::MemoryEntry;
-    use crate::pruning::EbbinghausPolicy;
-    use crate::test_support::{set_prune_hook, SyncBarrier};
-    use chrono::{Duration as ChronoDuration, Utc};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use chrono::Utc;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -886,152 +695,6 @@ mod tests {
         (storage, path)
     }
 
-    /// Concurrency test: pause prune_ebbinghaus() between SELECT and DELETE,
-    /// modify a candidate record via second connection, resume production DELETE.
-    /// Assert modified record survives and report counts are correct.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "global hook; run with --ignored --test-threads=1"]
-    async fn prune_concurrent_modification_via_production_path() {
-        let (storage, path) = open_test_db("conc").await;
-        let session = "conc-test";
-
-        let old = Utc::now() - ChronoDuration::days(365);
-        for i in 0..10 {
-            let mut e = test_entry(session, &format!("victim {}", i));
-            e.created_at = old;
-            e.last_accessed = old;
-            storage.store(e).await.unwrap();
-        }
-
-        // Set up sync barrier: hook fires after batch SELECT, waits for our signal
-        let barrier = SyncBarrier::new();
-        let _guard = set_prune_hook(barrier.hook());
-
-        // Clone storage for second connection to modify records
-        let storage2 = SqliteStorage::open(&path).await.unwrap();
-
-        // Spawn prune on a blocking task so we can interact concurrently
-        let storage_clone = SqliteStorage::open(&path).await.unwrap();
-        let policy = EbbinghausPolicy::default();
-        let handle =
-            tokio::spawn(async move { storage_clone.prune_ebbinghaus(&policy, Utc::now()).await });
-
-        // Wait for hook to fire (prune has done SELECT, paused before DELETE)
-        assert!(
-            barrier.wait_fired(std::time::Duration::from_secs(5)),
-            "hook must fire within timeout"
-        );
-
-        // NOW modify a candidate record via second connection (between SELECT and DELETE)
-        // Direct SQL UPDATE: change access_count and last_accessed
-        let target_id: String =
-            sqlx::query("SELECT id FROM memories WHERE content LIKE 'victim 3%' LIMIT 1")
-                .fetch_one(storage2.pool())
-                .await
-                .unwrap()
-                .get(0);
-        sqlx::query(
-            "UPDATE memories SET access_count = access_count + 1, last_accessed = ?1 WHERE id = ?2",
-        )
-        .bind(Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true))
-        .bind(&target_id)
-        .execute(storage2.pool())
-        .await
-        .unwrap();
-
-        // Signal hook to proceed — production DELETE now runs with stale snapshot
-        barrier.proceed();
-
-        // Wait for prune to complete
-        let result = handle.await.unwrap();
-        assert!(result.is_ok(), "prune must complete successfully");
-
-        let report = result.unwrap();
-        // 10 examined, 9 deleted, 0 retained (1 modified = skipped by conditional DELETE)
-        assert_eq!(report.entries_examined, 10);
-        assert_eq!(report.entries_deleted, 9);
-        assert_eq!(report.entries_retained, 0); // modified record is skipped (not deleted, not retained)
-
-        // Modified record must still exist (check via direct SQL)
-        let count: i64 = sqlx::query("SELECT COUNT(*) FROM memories")
-            .fetch_one(storage.pool())
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(
-            count, 1,
-            "concurrently modified record must survive production DELETE, got {} remaining",
-            count
-        );
-
-        drop(_guard); // clear hook
-        drop(storage);
-        drop(storage2);
-        let _ = std::fs::remove_file(path);
-    }
-
-    /// Failure injection: first batch commits, second batch fails after SELECT
-    /// but before DELETE. Verify first batch remains deleted, second batch
-    /// records remain (DELETE never executed). Retry cleans up remainder.
-    #[tokio::test]
-    #[ignore = "global hook; run with --ignored --test-threads=1"]
-    async fn prune_partial_failure_batches() {
-        static CALLS: AtomicUsize = AtomicUsize::new(0);
-        CALLS.store(0, Ordering::SeqCst);
-
-        let _guard = set_prune_hook(Arc::new(move |_n: usize| {
-            let c = CALLS.fetch_add(1, Ordering::SeqCst);
-            if c >= 1 {
-                Err(format!("injected failure at call {}", c))
-            } else {
-                Ok(())
-            }
-        }));
-
-        let (storage, _path) = open_test_db("fail").await;
-        let session = "fail-test";
-
-        let old = Utc::now() - ChronoDuration::days(365);
-        for i in 0..300 {
-            let mut e = test_entry(session, &format!("fv {}", i));
-            e.created_at = old;
-            e.last_accessed = old;
-            storage.store(e).await.unwrap();
-        }
-
-        let policy = EbbinghausPolicy::default();
-        let result = storage.prune_ebbinghaus(&policy, Utc::now()).await;
-        assert!(result.is_err(), "must fail on second batch");
-
-        // Count remaining records via direct SQL (bypasses query scoring)
-        let count: i64 = sqlx::query("SELECT COUNT(*) FROM memories")
-            .fetch_one(storage.pool())
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(
-            count, 44,
-            "batch 1 (256) committed, batch 2 (44) DELETE not executed: got {} remaining",
-            count
-        );
-
-        drop(_guard); // clear hook
-
-        // Retry without hook — should clean up remaining 44
-        let result2 = storage.prune_ebbinghaus(&policy, Utc::now()).await;
-        assert!(result2.is_ok(), "retry must succeed");
-        let report2 = result2.unwrap();
-        assert_eq!(report2.entries_examined, 44);
-        assert_eq!(report2.entries_deleted, 44);
-
-        let count2: i64 = sqlx::query("SELECT COUNT(*) FROM memories")
-            .fetch_one(storage.pool())
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(count2, 0, "all records must be deleted after retry");
-    }
-
     /// Verify MAX_QUERY_CANDIDATES=1000 hard cap at the SQL fetch boundary.
     /// Uses LAST_QUERY_CANDIDATE_COUNT observer (in test_support, cfg(test) only).
     #[tokio::test]
@@ -1069,45 +732,6 @@ mod tests {
         );
     }
 
-    /// Report accounting identity: examined == deleted + retained (no skips).
-    #[tokio::test]
-    async fn report_accounting_identity() {
-        let (storage, path) = open_test_db("acct").await;
-        let session = "acct-test";
-
-        let old = Utc::now() - ChronoDuration::days(365);
-        for i in 0..10 {
-            let mut e = test_entry(session, &format!("acc {}", i));
-            e.created_at = old;
-            e.last_accessed = old;
-            storage.store(e).await.unwrap();
-        }
-
-        // Make 3 fresh via second connection
-        let storage2 = SqliteStorage::open(&path).await.unwrap();
-        for i in 0..3 {
-            let q = Query {
-                text: format!("acc {}", i),
-                session_id: Some(session.into()),
-                work_item_id: None,
-                limit: 1,
-                threshold: 0.0,
-            };
-            let _ = storage2.query(&q).await.unwrap();
-        }
-
-        let policy = EbbinghausPolicy::default();
-        let report = storage.prune_ebbinghaus(&policy, Utc::now()).await.unwrap();
-
-        assert_eq!(report.entries_examined, 10);
-        assert_eq!(report.entries_retained, 3);
-        assert_eq!(report.entries_deleted, 7);
-        assert_eq!(
-            report.entries_examined,
-            report.entries_deleted + report.entries_retained,
-            "examined == deleted + retained when no concurrent skips"
-        );
-    }
     #[test]
     fn lexical_score_rejects_single_character_cjk_queries() {
         let query_tokens = tokenize("天");
@@ -1401,18 +1025,15 @@ mod tests {
             "wal crud operation verification content"
         );
 
-        // Delete.
-        // MemoryAdapter exposes prune(before), rather than a delete(id)
-        // method. Use its production deletion path for this verification.
-        let deleted = storage
-            .prune(Utc::now() + ChronoDuration::seconds(1))
+        // Delete (v0.1 has no pruning API; delete the row directly).
+        let deleted = sqlx::query("DELETE FROM memories WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&storage.pool)
             .await
-            .unwrap();
+            .unwrap()
+            .rows_affected();
 
-        assert_eq!(
-            deleted, 1,
-            "prune() must delete the stored memory under WAL"
-        );
+        assert_eq!(deleted, 1, "the stored memory must be deletable under WAL");
 
         let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE id = ?")
             .bind(id.to_string())
@@ -1727,102 +1348,6 @@ mod tests {
             drop(storage);
             remove_db_files(&path);
         }
-    }
-
-    /// Failure injection after a successful DELETE inside the second batch.
-    /// The first batch remains committed while the entire failing transaction rolls back.
-    #[tokio::test]
-    #[ignore = "global hook; run with --ignored --test-threads=1"]
-    async fn prune_rolls_back_failure_after_delete_within_batch() {
-        let (storage, path) = open_test_db("in-batch-rollback").await;
-        let old = Utc::now() - ChronoDuration::days(365);
-        let mut ids = Vec::new();
-
-        for index in 0..258_u128 {
-            let mut entry = test_entry("in-batch-rollback", &format!("rollback victim {index}"));
-            entry.id = Uuid::from_u128(index + 1);
-            entry.created_at = old;
-            entry.last_accessed = old;
-            entry.access_count = 1;
-            ids.push(entry.id.to_string());
-            storage.store(entry).await.unwrap();
-        }
-
-        const FAILURE: &str = "F07_PRUNE_AFTER_FIRST_DELETE_IN_SECOND_BATCH";
-        let _guard =
-            crate::test_support::set_prune_delete_hook(Arc::new(|successful_delete_ordinal| {
-                if successful_delete_ordinal == 257 {
-                    Err(FAILURE.to_string())
-                } else {
-                    Ok(())
-                }
-            }));
-
-        let policy = EbbinghausPolicy::default();
-        let error = match storage.prune_ebbinghaus(&policy, Utc::now()).await {
-            Ok(_) => panic!("prune must fail after the first DELETE in batch two"),
-            Err(error) => error,
-        };
-        assert!(
-            error.to_string().contains(FAILURE),
-            "error must preserve injected failure identifier: {error}"
-        );
-        drop(_guard);
-
-        let committed_batch_count: i64 = sqlx::query("SELECT COUNT(*) FROM memories WHERE id <= ?")
-            .bind(&ids[255])
-            .fetch_one(storage.pool())
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(
-            committed_batch_count, 0,
-            "all 256 records in the previously committed batch must remain deleted"
-        );
-
-        let failed_batch = sqlx::query(
-            "SELECT id, access_count, last_accessed FROM memories WHERE id > ? ORDER BY id",
-        )
-        .bind(&ids[255])
-        .fetch_all(storage.pool())
-        .await
-        .unwrap();
-        assert_eq!(
-            failed_batch.len(),
-            2,
-            "both records in the failed batch must remain"
-        );
-        for (index, row) in failed_batch.iter().enumerate() {
-            assert_eq!(row.get::<String, _>("id"), ids[256 + index]);
-            assert_eq!(row.get::<i32, _>("access_count"), 1);
-            assert_eq!(
-                row.get::<String, _>("last_accessed"),
-                old.to_rfc3339_opts(SecondsFormat::Nanos, true),
-                "failed-batch access metadata must be unchanged"
-            );
-        }
-
-        let retry = storage
-            .prune_ebbinghaus(&policy, Utc::now())
-            .await
-            .expect("retry must delete the rolled-back batch");
-        assert_eq!(retry.entries_examined, 2);
-        assert_eq!(retry.entries_deleted, 2);
-        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories")
-            .fetch_one(storage.pool())
-            .await
-            .unwrap();
-        assert_eq!(remaining, 0);
-
-        let second_retry = storage
-            .prune_ebbinghaus(&policy, Utc::now())
-            .await
-            .expect("subsequent retry must remain safe");
-        assert_eq!(second_retry.entries_examined, 0);
-        assert_eq!(second_retry.entries_deleted, 0);
-
-        drop(storage);
-        let _ = std::fs::remove_file(path);
     }
 
     /// Failure injection after ALTER TABLE verifies transactional DDL rollback,
