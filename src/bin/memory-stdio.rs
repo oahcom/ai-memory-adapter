@@ -430,11 +430,23 @@ fn work_item_scope(payload: &Map<String, Value>) -> Result<String, Failure> {
     }
 }
 
+/// Contract §3 fixes one canonical form: `wi_<UUIDv4>` in lowercase hyphenated
+/// 8-4-4-4-12 notation. `Uuid::parse_str` alone is too permissive — it also
+/// accepts braced, `urn:uuid:`-prefixed, uppercase and unhyphenated input.
 fn is_work_item_id(value: &str) -> bool {
-    value
-        .strip_prefix("wi_")
-        .and_then(|rest| Uuid::parse_str(rest).ok())
-        .is_some_and(|id| id.get_version_num() == 4)
+    let Some(rest) = value.strip_prefix("wi_") else {
+        return false;
+    };
+    let bytes = rest.as_bytes();
+    bytes.len() == 36
+        && bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '-' || c.is_ascii_lowercase())
+        && Uuid::parse_str(rest).is_ok_and(|id| id.get_version_num() == 4)
 }
 
 fn required_str(payload: &Map<String, Value>, field: &str) -> Result<String, Failure> {

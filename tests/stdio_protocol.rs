@@ -249,6 +249,49 @@ fn invalid_identifier_is_rejected() {
     }
 }
 
+// Contract §3 fixes a single canonical form, `wi_<UUIDv4>` in lowercase
+// hyphenated notation. `Uuid::parse_str` alone also accepts all four of these.
+#[test]
+fn non_canonical_work_item_id_forms_are_rejected() {
+    let db = database_path("id-canonical");
+    let _cleanup = Removal(db.clone());
+
+    for bad in [
+        "wi_550e8400e29b41d4a716446655440000",
+        "wi_550E8400-E29B-41D4-A716-446655440000",
+        "wi_{550e8400-e29b-41d4-a716-446655440000}",
+        "wi_urn:uuid:550e8400-e29b-41d4-a716-446655440000",
+    ] {
+        let response = response(&invoke(
+            &db,
+            &store_request("req_005a", bad, "session-001", "content"),
+        ));
+        assert_eq!(
+            error_code(&response),
+            "INVALID_ID",
+            "non-canonical form must be rejected: {bad}"
+        );
+    }
+}
+
+#[test]
+fn canonical_work_item_id_is_accepted() {
+    let db = database_path("id-accepted");
+    let _cleanup = Removal(db.clone());
+
+    let response = response(&invoke(
+        &db,
+        &store_request(
+            "req_005b",
+            "wi_550e8400-e29b-41d4-a716-446655440000",
+            "session-001",
+            "content",
+        ),
+    ));
+
+    assert_eq!(response["ok"], Value::Bool(true), "response: {response}");
+}
+
 #[test]
 fn missing_work_item_scope_is_rejected() {
     let db = database_path("scope");
