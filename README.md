@@ -1,71 +1,109 @@
 # AI Memory Adapter
 
-🦀 **Rust-based** memory layer for AI Brain Architecture project.
+Rust memory persistence and WorkItem-scoped retrieval for the AI Brain
+Architecture project. The adapter is a local process dependency of Session Ops,
+not a WorkItem lifecycle manager and not a network service.
 
-## Problem
+## Responsibilities
 
-ChatGPT sessions have no persistent memory → context fragmentation → frequent restarts.
+- Persist memory records in SQLite.
+- Retrieve records inside an explicitly supplied WorkItem scope.
+- Preserve Session Ops provenance across persistence and retrieval.
+- Render bounded context without allowing stored content to forge record
+  boundaries or metadata headers.
+- Keep Adapter Core independent of transport and optional vector backends.
+- Expose the direct Session Ops integration through the local `memory-stdio`
+  process boundary.
 
-## Solution
+Session Ops remains authoritative for WorkItem identity, lifecycle, and
+session-to-WorkItem association. See
+[`docs/integration/session-ops-contract-v0.1.md`](docs/integration/session-ops-contract-v0.1.md)
+for the frozen SO–MA v0.1 protocol.
 
-```
-Memory Adapter (Interface)
-├── Storage (SQLite + Vector DB)
-├── Context Injection (Smart context loading)
-└── Pruning (Ebbinghaus forgetting curve)
-```
+## Runtime requirements
 
-## Architecture
+- Rust stable toolchain (edition 2021).
+- A writable absolute path for the SQLite database.
+- No Qdrant service or external network connection is required by the default
+  build.
 
-```rust
-pub trait MemoryAdapter {
-    async fn store(&self, entry: MemoryEntry) -> Result<EntryId>;
-    async fn query(&self, query: &Query) -> Result<Vec<MemoryEntry>>;
-    async fn inject_context(&self, session_id: &str) -> Result<Context>;
-    async fn prune(&self, retention_policy: &RetentionPolicy) -> Result<PruneReport>;
-}
-```
-
-## Development
-
-Developed by ChatGPT on remote server `43.138.133.238` following AI-STD-001 spec.
-
-## Tech Stack
-
-- **Language**: Rust 2021 edition
-- **Database**: SQLx + SQLite
-- **Vector DB**: none by default — SQLite is the only default backend; `qdrant` and `faiss-backend` are explicit opt-in Cargo features (`default = []`)
-- **Async Runtime**: Tokio
-
-## Quick Start
+## Build and test
 
 ```bash
-cargo build --release
-cargo test
-./target/release/memory-adapter
+cargo fmt --all -- --check
+cargo build --release --bin memory-stdio
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
 ```
 
-## Work Item scoped retrieval
+## Run the adapter
 
-A memory may optionally carry a stable `work_item_id` in addition to its
-session identifier. Use the Work Item scope when related work continues across
-multiple ChatGPT sessions:
+The v0.1 contract is **one request per process invocation**. The process reads
+one UTF-8 JSON request line from stdin, writes exactly one JSON response line
+to stdout, and sends diagnostics only to stderr. `--db` takes precedence over
+`MA_SQLITE_PATH`; the selected database path must be absolute.
 
-```rust
-let results = adapter.query(&Query {
-    text: "migration design".into(),
-    session_id: None,
-    work_item_id: Some("WI-123".into()),
-    limit: 10,
-    threshold: 0.5,
-}).await?;
-
-let context = injector.inject_work_item("WI-123", "migration design").await?;
+```bash
+cargo build --release --bin memory-stdio
+printf '%s\n' '{"contract_version":"0.1","request_id":"req_001","operation":"retrieve","payload":{"work_item_id":"wi_550e8400-e29b-41d4-a716-446655440000","query":"migration design","limit":10,"threshold":0.34}}' \
+  | ./target/release/memory-stdio --db /var/lib/ai-memory-adapter/memory.sqlite3
 ```
 
-When both `work_item_id` and `session_id` are supplied, both filters apply.
-Existing databases are migrated with a nullable column; legacy records remain
-unscoped and are not returned by a named Work Item query. An omitted Work Item
-scope preserves the pre-existing session/global query behavior.
+Create the database directory before launching the adapter and grant the
+service account exclusive write access to it. Do not place the database in a
+world-writable directory. Back up the database using a SQLite-consistent backup
+procedure; copying only the main `.sqlite3` file while WAL mode is active is
+not a safe backup strategy.
 
-**Rust source compatibility:** this crate is currently pre-1.0 (`0.x`). Adding public fields to `MemoryEntry` and `Query` is source-breaking for downstream code that constructs these structs with exhaustive struct literals; those callers must add `work_item_id`. Serde defaults preserve compatibility with older serialized data, not Rust source code.
+## Production-readiness boundary
+
+The v0.1 stdio path is an integration interface, **not an authenticated remote
+multi-user service and not production activation**. It filters by WorkItem ID,
+but a WorkItem ID is not an authorization credential and the local process
+boundary does not establish a remote caller's identity or grants. Do not expose
+this binary as a public or shared remote memory endpoint.
+
+The separate first-class Adapter MCP surface and its principal → tenant →
+WorkItem authorization model are tracked in
+[issue #25](https://github.com/oahcom/ai-memory-adapter/issues/25). That work
+must define and enforce verified identity, per-WorkItem grants, bounded
+payloads/results, and read/write authorization before remote private-memory
+access is considered ready. A separately deployed RMC OAuth endpoint is not,
+by itself, evidence that Adapter memory calls have those grants.
+
+Production data access, deployment, and activation remain separate approval
+gates; a successful local build or stdio test does not satisfy them.
+
+## WorkItem-scoped retrieval
+
+Every direct Session Ops store and retrieve request must carry a canonical
+`wi_<lowercase UUIDv4>` WorkItem ID. A WorkItem may span multiple Sessions;
+when `session_id` is also supplied to retrieval, it narrows the result within
+that WorkItem. The adapter never infers WorkItem identity from a Session ID.
+
+Legacy records without a WorkItem ID remain unscoped and are not returned by a
+WorkItem-scoped request. They are not automatically assigned to a WorkItem.
+
+## Storage and retrieval characteristics
+
+- SQLite is the only default storage backend (`default = []`).
+- Qdrant and FAISS dependency feature flags remain in the manifest for future
+  work, but no Qdrant/FAISS storage implementation is present in this baseline;
+  do not enable or treat them as supported production backends.
+- Retrieval uses bounded SQLite candidate selection and lexical relevance
+  scoring; it does not promise embedding-based semantic retrieval.
+- `request_id` is a correlation identifier, not an idempotency key. A caller
+  must not blindly retry a Store whose outcome is uncertain after a timeout.
+- The v0.1 stdio protocol does not expose WorkItem lifecycle operations, global
+  search, delete/update-by-id, or administrative pruning.
+- The Core `Query` API rejects fully unscoped queries; session-only and
+  WorkItem-only queries remain supported for their respective legacy and
+  cross-session use cases. Session-only filtering is not a substitute for
+  verified WorkItem authorization when Session IDs can be reused.
+
+## Compatibility
+
+This crate is pre-1.0. Public struct fields may change between 0.x releases.
+Adding `work_item_id` to `MemoryEntry` and `Query` is source-breaking for
+callers using exhaustive Rust struct literals. Serde defaults preserve older
+serialized data only; they do not preserve Rust source compatibility.

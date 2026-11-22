@@ -98,6 +98,37 @@ async fn query_isolates_sessions() {
 }
 
 #[tokio::test]
+async fn query_supports_session_only_scope_at_storage_level() {
+    let (storage, path) = open_db("session-only-query-scope").await;
+    storage
+        .store(entry("session-a", "session-only scoped Rust memory"))
+        .await
+        .unwrap();
+    storage
+        .store(entry("session-b", "session-only scoped Rust memory"))
+        .await
+        .unwrap();
+
+    let results = storage
+        .query(&Query {
+            text: "session-only scoped Rust memory".into(),
+            session_id: Some("session-a".into()),
+            work_item_id: None,
+            limit: 10,
+            threshold: 1.0,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].session_id, "session-a");
+    assert_eq!(results[0].work_item_id.as_deref(), Some("wi-scope"));
+
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn query_applies_threshold_and_limit() {
     let (storage, path) = open_db("threshold").await;
     storage
