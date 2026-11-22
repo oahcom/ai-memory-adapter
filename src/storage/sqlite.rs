@@ -276,13 +276,17 @@ impl MemoryAdapter for SqliteStorage {
 
         let mut tx = self.pool.begin().await.map_err(storage_error)?;
 
-        // Candidate selection keeps the 80/20 recent/older split and applies the
-        // same work-item/session scope predicate to both layers.
+        // At least one scope is mandatory (enforced by query.validate()).
+        // A missing work_item_id permits session-scoped retrieval.
         let filter_clause = match (&query.work_item_id, &query.session_id) {
             (Some(_), Some(_)) => " WHERE work_item_id = ? AND session_id = ?",
             (Some(_), None) => " WHERE work_item_id = ?",
             (None, Some(_)) => " WHERE session_id = ?",
-            (None, None) => "",
+            (None, None) => {
+                return Err(AdapterError::Validation(
+                    "query must be scoped by work_item_id or session_id".into(),
+                ));
+            }
         };
 
         let recent_sql = format!(

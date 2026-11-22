@@ -20,7 +20,7 @@ fn memory(session_id: &str, content: &str) -> MemoryEntry {
     MemoryEntry {
         id: Uuid::new_v4(),
         session_id: session_id.into(),
-        work_item_id: None,
+        work_item_id: Some("wi-scope".into()),
         content: content.into(),
         embedding: None,
         metadata: json!({"source": "context-injector-test"}),

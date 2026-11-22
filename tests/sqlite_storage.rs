@@ -24,7 +24,7 @@ fn entry(session_id: &str, content: &str) -> MemoryEntry {
     MemoryEntry {
         id: Uuid::new_v4(),
         session_id: session_id.into(),
-        work_item_id: None,
+        work_item_id: Some("wi-scope".into()),
         content: content.into(),
         embedding: Some(vec![0.1, 0.2, 0.3]),
         metadata: json!({"source": "integration-test"}),
@@ -51,7 +51,7 @@ async fn store_and_query_round_trip() {
         .query(&Query {
             text: "Rust memory".into(),
             session_id: Some("session-a".into()),
-            work_item_id: None,
+            work_item_id: Some("wi-scope".into()),
             limit: 10,
             threshold: 1.0,
         })
@@ -84,7 +84,7 @@ async fn query_isolates_sessions() {
         .query(&Query {
             text: "Rust memory".into(),
             session_id: Some("session-a".into()),
-            work_item_id: None,
+            work_item_id: Some("wi-scope".into()),
             limit: 10,
             threshold: 1.0,
         })
@@ -111,7 +111,7 @@ async fn query_applies_threshold_and_limit() {
         .query(&Query {
             text: "Rust memory".into(),
             session_id: Some("s".into()),
-            work_item_id: None,
+            work_item_id: Some("wi-scope".into()),
             limit: 1,
             threshold: 0.5,
         })
@@ -191,7 +191,7 @@ async fn database_can_be_reopened() {
             .query(&Query {
                 text: "persistent reopen".into(),
                 session_id: Some("s".into()),
-                work_item_id: None,
+                work_item_id: Some("wi-scope".into()),
                 limit: 5,
                 threshold: 1.0,
             })
@@ -216,7 +216,7 @@ async fn access_count_overflow_returns_error_without_wrapping() {
         .query(&Query {
             text: "overflow guard".into(),
             session_id: Some("s".into()),
-            work_item_id: None,
+            work_item_id: Some("wi-scope".into()),
             limit: 5,
             threshold: 1.0,
         })
@@ -251,7 +251,7 @@ async fn query_preserves_future_created_at_invariant() {
         .query(&Query {
             text: "future timestamp".into(),
             session_id: Some("s".into()),
-            work_item_id: None,
+            work_item_id: Some("wi-scope".into()),
             limit: 5,
             threshold: 1.0,
         })
@@ -303,7 +303,7 @@ async fn inject_context_preserves_future_created_at_invariant() {
         .query(&Query {
             text: "future context".into(),
             session_id: Some("s".into()),
-            work_item_id: None,
+            work_item_id: Some("wi-scope".into()),
             limit: 5,
             threshold: 1.0,
         })
@@ -354,7 +354,7 @@ async fn query_candidate_limit_is_respected() {
     let q = Query {
         text: "rust".into(),
         session_id: Some(session.into()),
-        work_item_id: None,
+        work_item_id: Some("wi-scope".into()),
         limit: 5,
         threshold: 0.0,
     };
@@ -382,7 +382,7 @@ async fn query_deterministic_ordering() {
     let q = Query {
         text: "deterministic".into(),
         session_id: Some(session.into()),
-        work_item_id: None,
+        work_item_id: Some("wi-scope".into()),
         limit: 5,
         threshold: 0.0,
     };
@@ -411,7 +411,7 @@ async fn query_with_many_entries_stays_bounded() {
     let q = Query {
         text: "searchable".into(),
         session_id: Some(session.into()),
-        work_item_id: None,
+        work_item_id: Some("wi-scope".into()),
         limit: 10,
         threshold: 0.0,
     };
@@ -441,7 +441,7 @@ async fn query_session_isolation_with_candidates() {
     let q = Query {
         text: "entry".into(),
         session_id: Some("session-a".into()),
-        work_item_id: None,
+        work_item_id: Some("wi-scope".into()),
         limit: 50,
         threshold: 0.0,
     };
@@ -903,4 +903,53 @@ async fn inject_context_uses_the_same_content_escaping_as_context_injector() {
 
     drop(storage);
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn query_validate_rejects_unscoped_query() {
+    let query = Query {
+        text: "test query".into(),
+        session_id: None,
+        work_item_id: None,
+        limit: 10,
+        threshold: 0.5,
+    };
+
+    let err = query.validate().unwrap_err();
+    assert!(
+        matches!(err, AdapterError::Validation(_)),
+        "an unscoped query must be rejected, got {err:?}"
+    );
+}
+
+#[test]
+fn query_validate_allows_session_only_scope() {
+    let query = Query {
+        text: "test query".into(),
+        session_id: Some("session-1".into()),
+        work_item_id: None,
+        limit: 10,
+        threshold: 0.5,
+    };
+
+    assert!(
+        query.validate().is_ok(),
+        "session-scoped retrieval must stay legal"
+    );
+}
+
+#[test]
+fn query_validate_allows_work_item_only_scope() {
+    let query = Query {
+        text: "test query".into(),
+        session_id: None,
+        work_item_id: Some("WI-A".into()),
+        limit: 10,
+        threshold: 0.5,
+    };
+
+    assert!(
+        query.validate().is_ok(),
+        "work-item-scoped retrieval must stay legal"
+    );
 }
