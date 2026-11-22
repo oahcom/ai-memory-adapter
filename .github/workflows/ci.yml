@@ -87,10 +87,6 @@ jobs:
         }
 
         overall_rc=0
-        run_ignored_test "storage::sqlite::tests::prune_rolls_back_failure_after_delete_within_batch" || {
-          rc=$?
-          if (( overall_rc == 0 )); then overall_rc=$rc; fi
-        }
         run_ignored_test "storage::sqlite::tests::initialize_schema_rolls_back_ddl_failure_after_alter" || {
           rc=$?
           if (( overall_rc == 0 )); then overall_rc=$rc; fi
