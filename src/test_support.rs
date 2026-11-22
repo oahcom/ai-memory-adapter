@@ -5,31 +5,6 @@
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-type PruneHook = Arc<dyn Fn(usize) -> Result<(), String> + Send + Sync>;
-
-static PRUNE_TEST_HOOK: Mutex<Option<PruneHook>> = Mutex::new(None);
-type PruneDeleteHook = Arc<dyn Fn(usize) -> Result<(), String> + Send + Sync>;
-static PRUNE_DELETE_TEST_HOOK: Mutex<Option<PruneDeleteHook>> = Mutex::new(None);
-
-/// Get the current hook called after each successful DELETE in prune_ebbinghaus.
-pub(crate) fn prune_delete_hook() -> Option<PruneDeleteHook> {
-    PRUNE_DELETE_TEST_HOOK.lock().unwrap().clone()
-}
-
-/// Set the in-transaction DELETE hook. Returns a guard that clears it on drop.
-pub(crate) fn set_prune_delete_hook(hook: PruneDeleteHook) -> PruneDeleteHookGuard {
-    *PRUNE_DELETE_TEST_HOOK.lock().unwrap() = Some(hook);
-    PruneDeleteHookGuard
-}
-
-pub(crate) struct PruneDeleteHookGuard;
-
-impl Drop for PruneDeleteHookGuard {
-    fn drop(&mut self) {
-        *PRUNE_DELETE_TEST_HOOK.lock().unwrap() = None;
-    }
-}
-
 type SchemaMigrationHook = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 static SCHEMA_MIGRATION_TEST_HOOK: Mutex<Option<SchemaMigrationHook>> = Mutex::new(None);
 type SchemaMigrationIndexHook = Arc<dyn Fn(&str, bool) -> Result<(), String> + Send + Sync>;
@@ -72,78 +47,6 @@ pub(crate) struct SchemaMigrationHookGuard;
 impl Drop for SchemaMigrationHookGuard {
     fn drop(&mut self) {
         *SCHEMA_MIGRATION_TEST_HOOK.lock().unwrap() = None;
-    }
-}
-
-/// Get the current prune hook, if set.
-pub(crate) fn prune_hook() -> Option<PruneHook> {
-    PRUNE_TEST_HOOK.lock().unwrap().clone()
-}
-
-/// Set the prune hook. Returns a guard that clears the hook on drop.
-pub(crate) fn set_prune_hook(hook: PruneHook) -> HookGuard {
-    *PRUNE_TEST_HOOK.lock().unwrap() = Some(hook);
-    HookGuard
-}
-
-/// Guard that clears the hook when dropped (including on panic).
-pub(crate) struct HookGuard;
-
-impl Drop for HookGuard {
-    fn drop(&mut self) {
-        *PRUNE_TEST_HOOK.lock().unwrap() = None;
-    }
-}
-
-/// One-shot synchronization barrier for concurrency tests.
-/// The hook signals when it fires; the test waits for that signal,
-/// does its work, then allows the hook to proceed.
-pub(crate) struct SyncBarrier {
-    fired: Arc<Mutex<bool>>,
-    proceed: Arc<Mutex<bool>>,
-}
-
-impl SyncBarrier {
-    pub fn new() -> Self {
-        SyncBarrier {
-            fired: Arc::new(Mutex::new(false)),
-            proceed: Arc::new(Mutex::new(false)),
-        }
-    }
-
-    /// Returns a hook that signals `fired` and then waits for `proceed`.
-    pub fn hook(&self) -> PruneHook {
-        let fired = self.fired.clone();
-        let proceed = self.proceed.clone();
-        Arc::new(move |_batch: usize| {
-            *fired.lock().unwrap() = true;
-            // Busy-wait for proceed signal (test thread will set it)
-            loop {
-                if *proceed.lock().unwrap() {
-                    return Ok(());
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        })
-    }
-
-    /// Wait until the hook has fired (with timeout).
-    pub fn wait_fired(&self, timeout: std::time::Duration) -> bool {
-        let start = std::time::Instant::now();
-        loop {
-            if *self.fired.lock().unwrap() {
-                return true;
-            }
-            if start.elapsed() > timeout {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-    }
-
-    /// Signal the hook to proceed.
-    pub fn proceed(&self) {
-        *self.proceed.lock().unwrap() = true;
     }
 }
 

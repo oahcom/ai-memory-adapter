@@ -4,7 +4,6 @@
 
 pub mod adapter;
 pub mod context;
-pub mod pruning;
 pub mod storage;
 
 #[cfg(any(test, feature = "test-support"))]

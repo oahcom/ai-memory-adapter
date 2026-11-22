@@ -29,6 +29,3 @@ faiss-backend = ["faiss"]
 qdrant = ["qdrant-client"]
 test-support = []
 
-[[bin]]
-name = "memory-adapter"
-path = "src/main.rs"
