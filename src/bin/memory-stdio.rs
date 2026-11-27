@@ -501,7 +501,10 @@ async fn retrieve(
             "provenance": metadata
                 .pointer("/_so_contract/provenance")
                 .cloned()
-                .unwrap_or(Value::Null),
+                // Contract §10: `provenance` is an object. A record written
+                // outside this binary carries no SO provenance; `{}` keeps the
+                // field's shape instead of leaking a `null`.
+                .unwrap_or_else(|| json!({})),
             "created_at": created_at.to_rfc3339_opts(SecondsFormat::Secs, true),
             "score": score,
         }));

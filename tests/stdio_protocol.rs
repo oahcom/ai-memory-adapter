@@ -12,6 +12,8 @@ use std::{
 use serde_json::Value;
 use uuid::Uuid;
 
+use ai_memory_adapter::{adapter::MemoryAdapter, storage::SqliteStorage};
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_memory-stdio")
 }
@@ -617,6 +619,45 @@ fn non_positive_max_chars_is_rejected() {
         let parsed = response(&invoke(&db, &request.to_string()));
         assert_eq!(error_code(&parsed), "INVALID_REQUEST", "max_chars {bad}");
     }
+}
+
+/// Contract §10: every entry carries seven fields and `provenance` is an object.
+/// A record written outside this binary has no SO provenance and must still
+/// render as `{}`, never as `null`.
+#[test]
+fn entry_without_provenance_renders_an_empty_object() {
+    let db = database_path("provenance-absent");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime must build");
+    runtime.block_on(async {
+        let storage = SqliteStorage::open(&db).await.expect("storage must open");
+        let now = chrono::Utc::now();
+        storage
+            .store(ai_memory_adapter::adapter::MemoryEntry {
+                id: Uuid::new_v4(),
+                session_id: "session-001".to_owned(),
+                work_item_id: Some(item.clone()),
+                content: "migration completed".to_owned(),
+                embedding: None,
+                metadata: serde_json::json!({"owner": "so"}),
+                created_at: now,
+                access_count: 0,
+                last_accessed: now,
+            })
+            .await
+            .expect("entry must store");
+    });
+
+    let parsed = response(&invoke(&db, &retrieve_request("req_np", &item, None)));
+    let entry = &parsed["result"]["entries"][0];
+    assert_eq!(entry["provenance"], serde_json::json!({}));
+    assert_eq!(entry["session_id"], "session-001");
+    assert_eq!(entry["work_item_id"], item.as_str());
 }
 
 #[test]
