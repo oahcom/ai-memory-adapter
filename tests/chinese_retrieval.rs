@@ -24,7 +24,7 @@ fn entry(session_id: &str, content: &str) -> MemoryEntry {
     MemoryEntry {
         id: Uuid::new_v4(),
         session_id: session_id.into(),
-        work_item_id: None,
+        work_item_id: Some("wi-chinese-retrieval".into()),
         content: content.into(),
         embedding: None,
         metadata: json!({"source": "chinese-retrieval-test"}),
@@ -49,7 +49,7 @@ async fn search(storage: &SqliteStorage, text: &str) -> Vec<MemoryEntry> {
         .query(&Query {
             text: text.into(),
             session_id: None,
-            work_item_id: None,
+            work_item_id: Some("wi-chinese-retrieval".into()),
             limit: 20,
             threshold: 0.34,
         })

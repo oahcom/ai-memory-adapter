@@ -904,3 +904,75 @@ async fn inject_context_uses_the_same_content_escaping_as_context_injector() {
     drop(storage);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn query_validate_rejects_unscoped_query() {
+    let query = Query {
+        text: "test query".into(),
+        session_id: None,
+        work_item_id: None,
+        limit: 10,
+        threshold: 0.5,
+    };
+
+    let err = query.validate().unwrap_err();
+    assert!(
+        matches!(err, AdapterError::Validation(_)),
+        "an unscoped query must be rejected, got {err:?}"
+    );
+}
+
+#[test]
+fn query_validate_allows_session_only_scope() {
+    let query = Query {
+        text: "test query".into(),
+        session_id: Some("session-1".into()),
+        work_item_id: None,
+        limit: 10,
+        threshold: 0.5,
+    };
+
+    assert!(
+        query.validate().is_ok(),
+        "session-scoped retrieval must stay legal"
+    );
+}
+
+#[test]
+fn query_validate_allows_work_item_only_scope() {
+    let query = Query {
+        text: "test query".into(),
+        session_id: None,
+        work_item_id: Some("WI-A".into()),
+        limit: 10,
+        threshold: 0.5,
+    };
+
+    assert!(
+        query.validate().is_ok(),
+        "work-item-scoped retrieval must stay legal"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_query_rejects_unscoped_query() {
+    let (storage, path) = open_db("unscoped-query-rejected").await;
+
+    let result = storage
+        .query(&Query {
+            text: "unscoped retrieval must be rejected".into(),
+            session_id: None,
+            work_item_id: None,
+            limit: 10,
+            threshold: 0.5,
+        })
+        .await;
+
+    assert!(
+        matches!(result, Err(AdapterError::Validation(_))),
+        "SQLite query API must reject an unscoped query, got {result:?}"
+    );
+
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
