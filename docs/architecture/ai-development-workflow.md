@@ -159,7 +159,7 @@ rebase 和 squash 后，必须核对原 PR 变更是否完整保留。无冲突�
 
 | 能力 | 状态 | 可核验依据与边界 |
 |---|---|---|
-| P1-01 文件锁 fail-closed | **SUPPORTED** | Adapter main 已包含相关实现；历史记录为 commit `f6a0434`、104/104 测试。此项不代表整个跨仓库交付闭环完成。 |
+| P1-01 文件锁 fail-closed | **SUPPORTED** | Session Ops main 包含 commit `f6a04347d24ec92b73fbfbc2dc9d0b2d4be76069`（PR #1）；历史验证 104/104 测试。此项不代表整个跨仓库交付闭环完成。 |
 | ChatGPT 会话投递/收割工具 | **PARTIAL** | SO 有会话创建、续接和收割工具/脚本；这些是 legacy session-transport 能力，不等于获批的研发工作流。账号轮转、匿名回退及认证/挑战内部机制明确排除在 MCP 与试点之外。 |
 | GitHub 证据闭环 | **PARTIAL** | GitHub Issue/PR/commit/CI/review 记录可用，但 REQ-04 #265 AC6 仅 9/135 manifests 同时具备 prompt hash 与 implementation commit SHA；AC8 注意力/上下文切换成本 ABSENT。 |
 | 独立审查 | **PARTIAL** | 有独立会话审查模式和精确 SHA 绑定规则；REQ-12 #345 要求独立性有可验证证据。Reviewer prompt-pair provenance 未验证时，不得把角色标签或 Owner 自审称为独立审查。 |
@@ -168,8 +168,8 @@ rebase 和 squash 后，必须核对原 PR 变更是否完整保留。无冲突�
 | WorkItem → GitHub Issue 结构化映射 | **MISSING** | 当前 SO WorkItem 记录没有 canonical repository/issue reference；目前只能在 Work Unit 中显式携带，不能声称已持久化。 |
 | Session Ops MCP | **SUPPORTED** | SO main 有独立 MCP server、OIDC JWT verifier、10 个工作流工具和受限 schema/响应；Eligible ChatGPT custom-MCP 客户端的端到端连接验收仍 **NOT_VERIFIED**。 |
 | Adapter MCP | **MISSING** | Adapter main 无 `rmcp` 依赖、MCP 模块或 server target。Adapter #25 的设计决策已接受用于开发规划，但明确未授予 source implementation、remote exposure 或 deployment 权限。 |
-| P1-02 中文检索优化 | **SUPPORTED** | Adapter Core 的中文检索实现与回归测试存在；这只证明组件/测试能力，不证明真实 Agent 任务收益。 |
-| P1-03 时间偏置基准 | **NOT_VERIFIED** | 本轮未取得足以确认当前 main 实现/测试状态的精确证据；保留待核验，不沿用旧“计划中”标签。 |
+| P1-02 / P1-07 中文检索 | **SUPPORTED** | Adapter commits `a5b903930d83632edbb8a70282096d0ab34d2bc5`（CJK n-gram）与 `97a8e94ea734f14c04f600c6dfb6d1297aaf0d77`（单字符 CJK unigram 过滤）及对应回归测试已在 main；重复双字 bigram 边界仍有明确未解决项。组件测试不证明真实 Agent 收益。 |
+| P1-03 检索偏置评估基准 | **SUPPORTED** | Adapter commit `7538c8c0e9502068fe4e628dca3f54508abe7674`（PR #7）加入 `tests/retrieval_bias.rs` 评估 harness；实测 older-relevant candidate recall 0/20 并触发 CHANGE_REQUIRED。它证明评估载体存在，不代表初始检索表现合格；后续候选选择修复另由 #8 跟踪。 |
 | 跨仓库记忆共享 / 真实 Agent pilot | **PARTIAL** | Adapter Core 有 WorkItem-scoped store/retrieve；SO 侧有 retrieve 路径，但无已证明的生产 Store caller。#458 的三臂真实 Agent pilot 仍需 Owner 显式批准，#374 的 policy proxy 不是 integrated Brain runtime。 |
 | 生产部署 / 生产效果 | **NOT_VERIFIED / NOT_AUTHORIZED** | 当前证据不构成生产部署、生产数据访问、真实用户收益或生产 SLO 证明；相关授权仍未授予。 |
 
