@@ -43,10 +43,12 @@ cargo test
 ./target/release/memory-stdio --db /absolute/path/memory.sqlite3
 ```
 
-The v0.1 contract is one request per process invocation: one JSON request line
-on stdin, exactly one JSON response line on stdout, diagnostics on stderr only.
-The client does not have to close stdin; extra non-empty input is rejected with
-`INVALID_REQUEST` before any operation runs.
+The v0.1 contract processes only the first complete JSON request line received
+on stdin. A newline terminates the request; EOF also terminates a final
+non-empty request line. The process does not wait for stdin EOF after receiving
+a complete request line. Any subsequent input is never processed. The client
+does not have to close stdin. Each invocation writes exactly one JSON response
+line to stdout; diagnostics are written to stderr only.
 
 ## Work Item scoped retrieval
 

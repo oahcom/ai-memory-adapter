@@ -100,9 +100,18 @@ Transport uses UTF-8 JSON Lines.
 For v0.1:
 
 - One request per process invocation.
-- One JSON request line on stdin.
+- The first complete JSON request line is the only request
+  processed by that invocation.
+- A newline terminates a request line. EOF also terminates
+  a final non-empty request line without a trailing newline.
+- The process MUST NOT execute a second request from the same
+  stdin stream.
+- The process MUST NOT wait for stdin EOF after receiving a
+  complete request line.
+- Input following the first request line is never processed.
+- The client is not required to close stdin before receiving
+  the response.
 - One JSON response line on stdout.
-- EOF terminates the request.
 - stdout contains protocol data only.
 - stderr contains diagnostic information only.
 - No interactive prompts.

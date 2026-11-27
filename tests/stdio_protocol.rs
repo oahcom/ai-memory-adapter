@@ -952,47 +952,27 @@ fn provenance_is_always_an_object_and_preserves_valid_objects() {
     }
 }
 
+/// Contract §5: only the first complete request line is processed.
+/// A second request is never executed, and the process must respond without
+/// waiting for the client to close stdin.
 #[test]
-fn multiple_request_lines_are_rejected_before_any_operation_runs() {
-    let db = database_path("single-request");
+fn multiple_request_lines_only_process_the_first() {
+    let db = database_path("first-request-only");
     let _cleanup = Removal(db.clone());
     let item = work_item();
 
-    let input = format!(
-        "{}\n{}\n",
-        store_request("req_001", &item, "session-001", "migration completed"),
-        retrieve_request("req_002", &item, None)
+    let first = store_request(
+        "req_first",
+        &item,
+        "session-001",
+        "migration completed first",
     );
-    let rejected = response(&invoke(&db, &input));
-
-    assert_eq!(error_code(&rejected), "INVALID_REQUEST");
-    assert_eq!(rejected["request_id"], "req_001");
-
-    // The first Store must not have run before the extra line was rejected.
-    let retrieved = response(&invoke(&db, &retrieve_request("req_003", &item, None)));
-    assert_eq!(retrieved["request_id"], "req_003");
-    assert_eq!(
-        retrieved["result"]["entries"].as_array().map(Vec::len),
-        Some(0)
+    let second = store_request(
+        "req_second",
+        &item,
+        "session-002",
+        "migration completed second",
     );
-}
-
-#[test]
-fn empty_stdin_returns_one_invalid_request_response() {
-    let db = database_path("empty-stdin");
-    let _cleanup = Removal(db.clone());
-
-    let parsed = response(&invoke(&db, ""));
-    assert_eq!(error_code(&parsed), "INVALID_REQUEST");
-}
-
-/// Contract §5 is one request per invocation, but a client that keeps stdin
-/// open must still get its answer: the read must not wait for EOF.
-#[test]
-fn request_is_answered_without_closing_stdin() {
-    let db = database_path("open-stdin");
-    let _cleanup = Removal(db.clone());
-    let item = work_item();
 
     let mut child = Command::new(binary())
         .arg("--db")
@@ -1002,29 +982,118 @@ fn request_is_answered_without_closing_stdin() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("binary must start");
+
     let mut stdin = child.stdin.take().expect("stdin piped");
+
     stdin
-        // read_request() frames on the newline, so the request must be terminated
-        // even though this stdin is deliberately never closed.
-        .write_all(format!("{}\n", retrieve_request("req_open", &item, None)).as_bytes())
-        .expect("request must be writable");
-    stdin.flush().expect("request must be flushed");
+        .write_all(format!("{first}\n{second}\n").as_bytes())
+        .expect("both request lines must be writable");
+    stdin.flush().expect("requests must be flushed");
 
     let (tx, rx) = std::sync::mpsc::channel();
+
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
     });
+
+    // stdin remains open. The process must terminate after processing
+    // the first request, without waiting for EOF or executing the second.
     let output = rx
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .expect("the process must answer without waiting for stdin EOF")
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("process must respond without waiting for stdin EOF")
         .expect("binary must exit");
-    // stdin stays open until here, so the answer above cannot have needed EOF.
+
     drop(stdin);
 
-    let parsed = response(&Outcome {
+    let outcome = Outcome {
         stdout: String::from_utf8(output.stdout).expect("stdout is UTF-8"),
         stderr: String::from_utf8(output.stderr).expect("stderr is UTF-8"),
         code: output.status.code().expect("exit code"),
-    });
-    assert_eq!(parsed["request_id"], "req_open");
+    };
+
+    let parsed = response(&outcome);
+
+    assert_eq!(
+        parsed["request_id"], "req_first",
+        "the first request must determine the response"
+    );
+    assert_eq!(
+        parsed["ok"],
+        Value::Bool(true),
+        "the first Store request must execute successfully"
+    );
+
+    let retrieved = response(&invoke(&db, &retrieve_request("req_verify", &item, None)));
+
+    assert_eq!(
+        retrieved["request_id"], "req_verify",
+        "verification request must receive its own response"
+    );
+
+    let entries = retrieved["result"]["entries"]
+        .as_array()
+        .expect("entries must be an array");
+
+    assert_eq!(
+        entries.len(),
+        1,
+        "only the first Store request may have executed"
+    );
+
+    assert_eq!(
+        entries[0]["content"], "migration completed first",
+        "the second Store request must never execute"
+    );
+
+    assert_eq!(
+        entries[0]["session_id"], "session-001",
+        "the first request's session must be retained"
+    );
+}
+
+/// Contract §5: EOF terminates a final non-empty request line
+/// even when the client does not append a newline.
+#[test]
+fn eof_terminated_request_is_processed() {
+    let db = database_path("eof-terminated");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    let request = store_request(
+        "req_eof",
+        &item,
+        "session-eof",
+        "migration completed without newline",
+    );
+
+    assert!(
+        !request.ends_with('\n'),
+        "the test request must not contain a trailing newline"
+    );
+
+    let parsed = response(&invoke(&db, &request));
+
+    assert_eq!(parsed["ok"], Value::Bool(true));
+    assert_eq!(parsed["request_id"], "req_eof");
+
+    let retrieved = response(&invoke(
+        &db,
+        &retrieve_request("req_eof_verify", &item, None),
+    ));
+
+    let entries = retrieved["result"]["entries"]
+        .as_array()
+        .expect("entries must be an array");
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["content"], "migration completed without newline");
+}
+
+#[test]
+fn empty_stdin_returns_one_invalid_request_response() {
+    let db = database_path("empty-stdin");
+    let _cleanup = Removal(db.clone());
+
+    let parsed = response(&invoke(&db, ""));
+    assert_eq!(error_code(&parsed), "INVALID_REQUEST");
 }
