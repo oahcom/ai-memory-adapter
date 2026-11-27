@@ -810,43 +810,146 @@ fn non_positive_or_non_integer_max_chars_is_rejected() {
     }
 }
 
-/// Contract §10: every entry carries seven fields and `provenance` is an object.
-/// A record written outside this binary has no SO provenance and must still
-/// render as `{}`, never as `null`.
+/// Contract §10: provenance is always an object.
+/// Missing, null, and non-object metadata normalize to an empty object.
+/// A valid object is preserved without modification.
+/// Every returned entry has exactly seven fields.
 #[test]
-fn entry_without_provenance_renders_an_empty_object() {
-    let db = database_path("provenance-absent");
+fn provenance_is_always_an_object_and_preserves_valid_objects() {
+    let db = database_path("provenance-matrix");
     let _cleanup = Removal(db.clone());
     let item = work_item();
+
+    let valid_provenance = serde_json::json!({
+        "source_type": "execution_result",
+        "source_id": "session-valid",
+        "captured_at": "2026-11-21T10:00:00Z",
+        "custom": {
+            "origin": "integration-test"
+        }
+    });
+
+    let cases = [
+        ("missing", None),
+        ("null", Some(Value::Null)),
+        ("string", Some(Value::String("invalid".to_owned()))),
+        ("array", Some(serde_json::json!(["invalid"]))),
+        ("number", Some(Value::from(42))),
+        ("object", Some(valid_provenance.clone())),
+    ];
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime must build");
+
     runtime.block_on(async {
         let storage = SqliteStorage::open(&db).await.expect("storage must open");
-        let now = chrono::Utc::now();
-        storage
-            .store(ai_memory_adapter::adapter::MemoryEntry {
-                id: Uuid::new_v4(),
-                session_id: "session-001".to_owned(),
-                work_item_id: Some(item.clone()),
-                content: "migration completed".to_owned(),
-                embedding: None,
-                metadata: serde_json::json!({"owner": "so"}),
-                created_at: now,
-                access_count: 0,
-                last_accessed: now,
-            })
-            .await
-            .expect("entry must store");
+
+        for (label, provenance) in &cases {
+            let mut metadata = serde_json::json!({
+                "owner": "so"
+            });
+
+            if let Some(provenance) = provenance {
+                metadata["_so_contract"] = serde_json::json!({
+                    "provenance": provenance
+                });
+            }
+
+            let now = chrono::Utc::now();
+
+            storage
+                .store(ai_memory_adapter::adapter::MemoryEntry {
+                    id: Uuid::new_v4(),
+                    session_id: format!("session-{label}"),
+                    work_item_id: Some(item.clone()),
+                    content: format!("migration completed provenance-{label}"),
+                    embedding: None,
+                    metadata,
+                    created_at: now,
+                    access_count: 0,
+                    last_accessed: now,
+                })
+                .await
+                .expect("entry must store");
+        }
     });
 
-    let parsed = response(&invoke(&db, &retrieve_request("req_np", &item, None)));
-    let entry = &parsed["result"]["entries"][0];
-    assert_eq!(entry["provenance"], serde_json::json!({}));
-    assert_eq!(entry["session_id"], "session-001");
-    assert_eq!(entry["work_item_id"], item.as_str());
+    let parsed = response(&invoke(
+        &db,
+        &retrieve_request("req_provenance_matrix", &item, None),
+    ));
+
+    let entries = parsed["result"]["entries"]
+        .as_array()
+        .expect("entries must be an array");
+
+    assert_eq!(
+        entries.len(),
+        cases.len(),
+        "all six provenance cases must be retrieved"
+    );
+
+    for (label, expected) in cases {
+        let content = format!("migration completed provenance-{label}");
+
+        let entry = entries
+            .iter()
+            .find(|entry| entry["content"] == content)
+            .unwrap_or_else(|| panic!("missing provenance case: {label}"));
+
+        assert_eq!(
+            entry.as_object().map(serde_json::Map::len),
+            Some(7),
+            "entry {label} must contain exactly seven fields"
+        );
+
+        assert!(
+            entry.get("memory_id").is_some(),
+            "entry {label} must contain memory_id"
+        );
+        assert!(
+            entry.get("work_item_id").is_some(),
+            "entry {label} must contain work_item_id"
+        );
+        assert!(
+            entry.get("session_id").is_some(),
+            "entry {label} must contain session_id"
+        );
+        assert!(
+            entry.get("content").is_some(),
+            "entry {label} must contain content"
+        );
+        assert!(
+            entry.get("provenance").is_some(),
+            "entry {label} must contain provenance"
+        );
+        assert!(
+            entry.get("created_at").is_some(),
+            "entry {label} must contain created_at"
+        );
+        assert!(
+            entry.get("score").is_some(),
+            "entry {label} must contain score"
+        );
+
+        match expected {
+            Some(value) if value.is_object() => {
+                assert_eq!(
+                    entry["provenance"], value,
+                    "valid provenance object must be preserved unchanged"
+                );
+            }
+            _ => {
+                assert_eq!(
+                    entry["provenance"],
+                    serde_json::json!({}),
+                    "missing, null, and non-object provenance must normalize to {{}}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

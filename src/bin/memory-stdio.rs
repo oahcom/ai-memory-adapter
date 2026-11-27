@@ -500,6 +500,7 @@ async fn retrieve(
             "content": content,
             "provenance": metadata
                 .pointer("/_so_contract/provenance")
+                .filter(|value| value.is_object())
                 .cloned()
                 // Contract §10: `provenance` is an object. A record written
                 // outside this binary carries no SO provenance; `{}` keeps the
