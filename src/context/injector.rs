@@ -45,6 +45,36 @@ impl ContextConfig {
     }
 }
 
+/// Character budget shared by context assembly and the stdio renderer.
+///
+/// An entry is admitted whole or omitted; content is never truncated. Measuring
+/// in Unicode characters keeps the limit meaningful for non-ASCII content.
+#[derive(Debug, Clone)]
+pub struct CharBudget {
+    max_chars: usize,
+    used: usize,
+}
+
+impl CharBudget {
+    pub fn new(max_chars: usize) -> Self {
+        Self { max_chars, used: 0 }
+    }
+
+    /// Charges `required_chars` and reports whether the entry fits.
+    pub fn admit(&mut self, required_chars: usize) -> bool {
+        if required_chars > self.max_chars.saturating_sub(self.used) {
+            return false;
+        }
+        self.used += required_chars;
+        true
+    }
+
+    /// Characters charged so far.
+    pub fn used(&self) -> usize {
+        self.used
+    }
+}
+
 /// Result of context assembly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextResult {
@@ -144,7 +174,7 @@ impl<'a> ContextInjector<'a> {
         let mut text = String::new();
         let mut entries_included = 0;
         let mut entries_omitted = 0;
-        let mut chars_used = 0;
+        let mut budget = CharBudget::new(self.config.max_chars);
         let mut provenance = Vec::new();
 
         for memory in memories {
@@ -154,7 +184,7 @@ impl<'a> ContextInjector<'a> {
             let separator_chars = if text.is_empty() { 0 } else { 1 };
             let required_chars = line_chars.saturating_add(separator_chars);
 
-            if required_chars > self.config.max_chars.saturating_sub(chars_used) {
+            if !budget.admit(required_chars) {
                 entries_omitted += 1;
                 continue;
             }
@@ -163,7 +193,6 @@ impl<'a> ContextInjector<'a> {
                 text.push('\n');
             }
             text.push_str(&line);
-            chars_used += required_chars;
             entries_included += 1;
             provenance.push(memory.metadata.pointer("/_so_contract/provenance").cloned());
         }
@@ -172,7 +201,7 @@ impl<'a> ContextInjector<'a> {
             text,
             entries_included,
             entries_omitted,
-            chars_used,
+            chars_used: budget.used(),
             provenance,
         })
     }
@@ -198,7 +227,7 @@ impl<'a> ContextInjector<'a> {
         let mut text = String::new();
         let mut entries_included = 0;
         let mut entries_omitted = 0;
-        let mut chars_used = 0;
+        let mut budget = CharBudget::new(self.config.max_chars);
         let mut provenance = Vec::new();
         for memory in memories {
             // Fail closed if an adapter violates the requested scope. Do not
@@ -223,7 +252,7 @@ impl<'a> ContextInjector<'a> {
             );
             let separator_chars = if text.is_empty() { 0 } else { 1 };
             let required_chars = line.chars().count().saturating_add(separator_chars);
-            if required_chars > self.config.max_chars.saturating_sub(chars_used) {
+            if !budget.admit(required_chars) {
                 entries_omitted += 1;
                 continue;
             }
@@ -231,7 +260,6 @@ impl<'a> ContextInjector<'a> {
                 text.push('\n');
             }
             text.push_str(&line);
-            chars_used += required_chars;
             entries_included += 1;
             provenance.push(memory.metadata.pointer("/_so_contract/provenance").cloned());
         }
@@ -239,8 +267,41 @@ impl<'a> ContextInjector<'a> {
             text,
             entries_included,
             entries_omitted,
-            chars_used,
+            chars_used: budget.used(),
             provenance,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CharBudget;
+
+    #[test]
+    fn admit_zero_length_entry_with_zero_budget() {
+        let mut budget = CharBudget::new(0);
+
+        assert!(budget.admit(0));
+        assert_eq!(budget.used(), 0);
+
+        assert!(!budget.admit(1));
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn admit_zero_length_entry_does_not_consume_remaining_budget() {
+        let mut budget = CharBudget::new(2);
+
+        assert!(budget.admit(0));
+        assert_eq!(budget.used(), 0);
+
+        assert!(budget.admit(2));
+        assert_eq!(budget.used(), 2);
+
+        assert!(budget.admit(0));
+        assert_eq!(budget.used(), 2);
+
+        assert!(!budget.admit(1));
+        assert_eq!(budget.used(), 2);
     }
 }

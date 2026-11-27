@@ -12,6 +12,8 @@ use std::{
 use serde_json::Value;
 use uuid::Uuid;
 
+use ai_memory_adapter::{adapter::MemoryAdapter, storage::SqliteStorage};
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_memory-stdio")
 }
@@ -573,30 +575,525 @@ fn empty_retrieval_is_a_successful_result() {
 }
 
 #[test]
-fn multiple_requests_in_one_process_produce_one_response_each() {
-    let db = database_path("batch");
+fn max_chars_bounds_the_returned_entries() {
+    let db = database_path("max-chars");
     let _cleanup = Removal(db.clone());
     let item = work_item();
 
-    let input = format!(
-        "{}\n{}\n",
-        store_request("req_001", &item, "session-001", "migration completed"),
-        retrieve_request("req_002", &item, None)
+    invoke(
+        &db,
+        &store_request("req_a", &item, "session-001", "migration completed alpha"),
     );
-    let outcome = invoke(&db, &input);
+    invoke(
+        &db,
+        &store_request("req_b", &item, "session-001", "migration completed beta"),
+    );
 
-    let responses: Vec<Value> = outcome
-        .stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("each line is JSON"))
-        .collect();
-    assert_eq!(responses.len(), 2, "one response per request line");
-    assert_eq!(responses[0]["request_id"], "req_001");
-    assert_eq!(responses[1]["request_id"], "req_002");
+    // Absent max_chars keeps the old behaviour: nothing is omitted.
+    let unbounded = response(&invoke(&db, &retrieve_request("req_c", &item, None)));
     assert_eq!(
-        responses[1]["result"]["entries"].as_array().map(Vec::len),
-        Some(1)
+        unbounded["result"]["entries"].as_array().map(Vec::len),
+        Some(2)
     );
-    assert_eq!(outcome.code, 0);
+    assert_eq!(unbounded["result"]["entries_omitted"], 0);
+
+    // "migration completed alpha" is 25 characters, "... beta" is 24.
+    let mut request: Value = serde_json::from_str(&retrieve_request("req_d", &item, None))
+        .expect("retrieve request is JSON");
+    request["payload"]["max_chars"] = Value::from(24);
+    let bounded = response(&invoke(&db, &request.to_string()));
+    assert_eq!(bounded["result"]["entries_included"], 1);
+    assert_eq!(bounded["result"]["entries_omitted"], 1);
+}
+
+/// Contract §9: max_chars counts Unicode scalar values, not UTF-8 bytes.
+/// Entries are either included whole or omitted whole; content is never truncated.
+#[test]
+fn retrieve_max_chars_counts_unicode_scalars() {
+    let db = database_path("unicode-scalars");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    let content = "中🙂";
+
+    assert_eq!(content.chars().count(), 2);
+    assert_eq!(content.len(), 7);
+
+    invoke(
+        &db,
+        &store_request("req_unicode_store", &item, "session-unicode", content),
+    );
+
+    let mut exact_request: Value =
+        serde_json::from_str(&retrieve_request("req_unicode_exact", &item, None))
+            .expect("retrieve request is JSON");
+
+    exact_request["payload"]["max_chars"] = Value::from(2);
+
+    let exact = response(&invoke(&db, &exact_request.to_string()));
+
+    let exact_entries = exact["result"]["entries"]
+        .as_array()
+        .expect("entries must be an array");
+
+    assert_eq!(
+        exact_entries.len(),
+        1,
+        "two Unicode scalar values must fit budget 2"
+    );
+    assert_eq!(
+        exact_entries[0]["content"], content,
+        "accepted content must remain completely unchanged"
+    );
+    assert_eq!(exact["result"]["entries_included"], 1);
+    assert_eq!(exact["result"]["entries_omitted"], 0);
+
+    let mut insufficient_request: Value =
+        serde_json::from_str(&retrieve_request("req_unicode_short", &item, None))
+            .expect("retrieve request is JSON");
+
+    insufficient_request["payload"]["max_chars"] = Value::from(1);
+
+    let insufficient = response(&invoke(&db, &insufficient_request.to_string()));
+
+    let insufficient_entries = insufficient["result"]["entries"]
+        .as_array()
+        .expect("entries must be an array");
+
+    assert!(
+        insufficient_entries.is_empty(),
+        "a two-scalar entry must not be partially returned under budget 1"
+    );
+    assert_eq!(insufficient["result"]["entries_included"], 0);
+    assert_eq!(insufficient["result"]["entries_omitted"], 1);
+}
+
+/// Contract §9: max_chars is an aggregate budget over complete entries.
+/// The budget counts Unicode scalar values, accepts exact boundaries,
+/// and never truncates content.
+#[test]
+fn retrieve_max_chars_obeys_entry_budget_boundaries() {
+    // ASCII exact boundary: "abc" fits budget 3.
+    {
+        let db = database_path("budget-ascii-exact");
+        let _cleanup = Removal(db.clone());
+        let item = work_item();
+
+        invoke(&db, &store_request("req_a1", &item, "session-a", "abc"));
+
+        let mut request: Value = serde_json::from_str(&retrieve_request("req_a2", &item, None))
+            .expect("retrieve request is JSON");
+        request["payload"]["max_chars"] = Value::from(3);
+
+        let result = response(&invoke(&db, &request.to_string()));
+
+        assert_eq!(
+            result["result"]["entries"].as_array().map(Vec::len),
+            Some(1),
+            "ASCII content of length 3 must fit budget 3"
+        );
+        assert_eq!(result["result"]["entries"][0]["content"], "abc");
+        assert_eq!(result["result"]["entries_included"], 1);
+        assert_eq!(result["result"]["entries_omitted"], 0);
+    }
+
+    // ASCII over budget: "abcd" does not fit budget 3.
+    {
+        let db = database_path("budget-ascii-over");
+        let _cleanup = Removal(db.clone());
+        let item = work_item();
+
+        invoke(&db, &store_request("req_b1", &item, "session-b", "abcd"));
+
+        let mut request: Value = serde_json::from_str(&retrieve_request("req_b2", &item, None))
+            .expect("retrieve request is JSON");
+        request["payload"]["max_chars"] = Value::from(3);
+
+        let result = response(&invoke(&db, &request.to_string()));
+
+        assert!(
+            result["result"]["entries"].as_array().unwrap().is_empty(),
+            "ASCII content of length 4 must be omitted under budget 3"
+        );
+        assert_eq!(result["result"]["entries_included"], 0);
+        assert_eq!(result["result"]["entries_omitted"], 1);
+    }
+
+    // Exact cumulative boundary: "ab" + "cd" consumes exactly 4.
+    {
+        let db = database_path("budget-cumulative-exact");
+        let _cleanup = Removal(db.clone());
+        let item = work_item();
+
+        invoke(&db, &store_request("req_d1", &item, "session-d", "ab"));
+        invoke(&db, &store_request("req_d2", &item, "session-d", "cd"));
+
+        let mut request: Value = serde_json::from_str(&retrieve_request("req_d3", &item, None))
+            .expect("retrieve request is JSON");
+        request["payload"]["max_chars"] = Value::from(4);
+
+        let result = response(&invoke(&db, &request.to_string()));
+
+        assert_eq!(
+            result["result"]["entries"].as_array().map(Vec::len),
+            Some(2),
+            "two entries totaling exactly 4 characters must both fit"
+        );
+        assert_eq!(result["result"]["entries_included"], 2);
+        assert_eq!(result["result"]["entries_omitted"], 0);
+    }
+
+    // Cumulative over budget: "ab" fits, but adding "cde" exceeds 4.
+    // "cde" is stored first so that "ab" is returned first deterministically.
+    {
+        let db = database_path("budget-cumulative-over");
+        let _cleanup = Removal(db.clone());
+        let item = work_item();
+
+        invoke(&db, &store_request("req_e1", &item, "session-e", "cde"));
+        invoke(&db, &store_request("req_e2", &item, "session-e", "ab"));
+
+        let mut request: Value = serde_json::from_str(&retrieve_request("req_e3", &item, None))
+            .expect("retrieve request is JSON");
+        request["payload"]["max_chars"] = Value::from(4);
+
+        let result = response(&invoke(&db, &request.to_string()));
+
+        let entries = result["result"]["entries"]
+            .as_array()
+            .expect("entries must be an array");
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the first two-character entry must fit before the second exceeds budget"
+        );
+        assert_eq!(
+            entries[0]["content"], "ab",
+            "the first entry must be retained whole"
+        );
+        assert_eq!(result["result"]["entries_included"], 1);
+        assert_eq!(result["result"]["entries_omitted"], 1);
+    }
+}
+
+/// Contract §9: max_chars must be a strictly positive integer.
+/// Floats, booleans, strings, zero, and negative values are invalid.
+#[test]
+fn non_positive_or_non_integer_max_chars_is_rejected() {
+    let db = database_path("max-chars-invalid");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    let invalid_values = [
+        ("zero", Value::from(0)),
+        ("negative", Value::from(-1)),
+        ("fractional", serde_json::json!(1.5)),
+        ("boolean", Value::Bool(true)),
+        ("string", Value::String("2".to_owned())),
+    ];
+
+    for (label, bad) in invalid_values {
+        let mut request: Value =
+            serde_json::from_str(&retrieve_request("req_invalid", &item, None))
+                .expect("retrieve request is JSON");
+
+        request["payload"]["max_chars"] = bad.clone();
+
+        let parsed = response(&invoke(&db, &request.to_string()));
+
+        assert_eq!(
+            error_code(&parsed),
+            "INVALID_REQUEST",
+            "max_chars {label} ({bad}) must be rejected"
+        );
+    }
+}
+
+/// Contract §10: provenance is always an object.
+/// Missing, null, and non-object metadata normalize to an empty object.
+/// A valid object is preserved without modification.
+/// Every returned entry has exactly seven fields.
+#[test]
+fn provenance_is_always_an_object_and_preserves_valid_objects() {
+    let db = database_path("provenance-matrix");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    let valid_provenance = serde_json::json!({
+        "source_type": "execution_result",
+        "source_id": "session-valid",
+        "captured_at": "2026-11-21T10:00:00Z",
+        "custom": {
+            "origin": "integration-test"
+        }
+    });
+
+    let cases = [
+        ("missing", None),
+        ("null", Some(Value::Null)),
+        ("string", Some(Value::String("invalid".to_owned()))),
+        ("array", Some(serde_json::json!(["invalid"]))),
+        ("number", Some(Value::from(42))),
+        ("object", Some(valid_provenance.clone())),
+    ];
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime must build");
+
+    runtime.block_on(async {
+        let storage = SqliteStorage::open(&db).await.expect("storage must open");
+
+        for (label, provenance) in &cases {
+            let mut metadata = serde_json::json!({
+                "owner": "so"
+            });
+
+            if let Some(provenance) = provenance {
+                metadata["_so_contract"] = serde_json::json!({
+                    "provenance": provenance
+                });
+            }
+
+            let now = chrono::Utc::now();
+
+            storage
+                .store(ai_memory_adapter::adapter::MemoryEntry {
+                    id: Uuid::new_v4(),
+                    session_id: format!("session-{label}"),
+                    work_item_id: Some(item.clone()),
+                    content: format!("migration completed provenance-{label}"),
+                    embedding: None,
+                    metadata,
+                    created_at: now,
+                    access_count: 0,
+                    last_accessed: now,
+                })
+                .await
+                .expect("entry must store");
+        }
+    });
+
+    let parsed = response(&invoke(
+        &db,
+        &retrieve_request("req_provenance_matrix", &item, None),
+    ));
+
+    let entries = parsed["result"]["entries"]
+        .as_array()
+        .expect("entries must be an array");
+
+    assert_eq!(
+        entries.len(),
+        cases.len(),
+        "all six provenance cases must be retrieved"
+    );
+
+    for (label, expected) in cases {
+        let content = format!("migration completed provenance-{label}");
+
+        let entry = entries
+            .iter()
+            .find(|entry| entry["content"] == content)
+            .unwrap_or_else(|| panic!("missing provenance case: {label}"));
+
+        assert_eq!(
+            entry.as_object().map(serde_json::Map::len),
+            Some(7),
+            "entry {label} must contain exactly seven fields"
+        );
+
+        assert!(
+            entry.get("memory_id").is_some(),
+            "entry {label} must contain memory_id"
+        );
+        assert!(
+            entry.get("work_item_id").is_some(),
+            "entry {label} must contain work_item_id"
+        );
+        assert!(
+            entry.get("session_id").is_some(),
+            "entry {label} must contain session_id"
+        );
+        assert!(
+            entry.get("content").is_some(),
+            "entry {label} must contain content"
+        );
+        assert!(
+            entry.get("provenance").is_some(),
+            "entry {label} must contain provenance"
+        );
+        assert!(
+            entry.get("created_at").is_some(),
+            "entry {label} must contain created_at"
+        );
+        assert!(
+            entry.get("score").is_some(),
+            "entry {label} must contain score"
+        );
+
+        match expected {
+            Some(value) if value.is_object() => {
+                assert_eq!(
+                    entry["provenance"], value,
+                    "valid provenance object must be preserved unchanged"
+                );
+            }
+            _ => {
+                assert_eq!(
+                    entry["provenance"],
+                    serde_json::json!({}),
+                    "missing, null, and non-object provenance must normalize to {{}}"
+                );
+            }
+        }
+    }
+}
+
+/// Contract §5: only the first complete request line is processed.
+/// A second request is never executed, and the process must respond without
+/// waiting for the client to close stdin.
+#[test]
+fn multiple_request_lines_only_process_the_first() {
+    let db = database_path("first-request-only");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    let first = store_request(
+        "req_first",
+        &item,
+        "session-001",
+        "migration completed first",
+    );
+    let second = store_request(
+        "req_second",
+        &item,
+        "session-002",
+        "migration completed second",
+    );
+
+    let mut child = Command::new(binary())
+        .arg("--db")
+        .arg(&db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary must start");
+
+    let mut stdin = child.stdin.take().expect("stdin piped");
+
+    stdin
+        .write_all(format!("{first}\n{second}\n").as_bytes())
+        .expect("both request lines must be writable");
+    stdin.flush().expect("requests must be flushed");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+
+    // stdin remains open. The process must terminate after processing
+    // the first request, without waiting for EOF or executing the second.
+    let output = rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("process must respond without waiting for stdin EOF")
+        .expect("binary must exit");
+
+    drop(stdin);
+
+    let outcome = Outcome {
+        stdout: String::from_utf8(output.stdout).expect("stdout is UTF-8"),
+        stderr: String::from_utf8(output.stderr).expect("stderr is UTF-8"),
+        code: output.status.code().expect("exit code"),
+    };
+
+    let parsed = response(&outcome);
+
+    assert_eq!(
+        parsed["request_id"], "req_first",
+        "the first request must determine the response"
+    );
+    assert_eq!(
+        parsed["ok"],
+        Value::Bool(true),
+        "the first Store request must execute successfully"
+    );
+
+    let retrieved = response(&invoke(&db, &retrieve_request("req_verify", &item, None)));
+
+    assert_eq!(
+        retrieved["request_id"], "req_verify",
+        "verification request must receive its own response"
+    );
+
+    let entries = retrieved["result"]["entries"]
+        .as_array()
+        .expect("entries must be an array");
+
+    assert_eq!(
+        entries.len(),
+        1,
+        "only the first Store request may have executed"
+    );
+
+    assert_eq!(
+        entries[0]["content"], "migration completed first",
+        "the second Store request must never execute"
+    );
+
+    assert_eq!(
+        entries[0]["session_id"], "session-001",
+        "the first request's session must be retained"
+    );
+}
+
+/// Contract §5: EOF terminates a final non-empty request line
+/// even when the client does not append a newline.
+#[test]
+fn eof_terminated_request_is_processed() {
+    let db = database_path("eof-terminated");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    let request = store_request(
+        "req_eof",
+        &item,
+        "session-eof",
+        "migration completed without newline",
+    );
+
+    assert!(
+        !request.ends_with('\n'),
+        "the test request must not contain a trailing newline"
+    );
+
+    let parsed = response(&invoke(&db, &request));
+
+    assert_eq!(parsed["ok"], Value::Bool(true));
+    assert_eq!(parsed["request_id"], "req_eof");
+
+    let retrieved = response(&invoke(
+        &db,
+        &retrieve_request("req_eof_verify", &item, None),
+    ));
+
+    let entries = retrieved["result"]["entries"]
+        .as_array()
+        .expect("entries must be an array");
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["content"], "migration completed without newline");
+}
+
+#[test]
+fn empty_stdin_returns_one_invalid_request_response() {
+    let db = database_path("empty-stdin");
+    let _cleanup = Removal(db.clone());
+
+    let parsed = response(&invoke(&db, ""));
+    assert_eq!(error_code(&parsed), "INVALID_REQUEST");
 }

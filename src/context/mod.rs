@@ -2,4 +2,4 @@
 
 pub mod injector;
 
-pub use injector::{ContextConfig, ContextInjector, ContextResult};
+pub use injector::{CharBudget, ContextConfig, ContextInjector, ContextResult};

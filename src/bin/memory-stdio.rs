@@ -2,17 +2,17 @@
 //!
 //! Invocation: `memory-stdio --db <path>`; `MA_SQLITE_PATH` is the fallback.
 //!
-//! Framing: one JSON request per input line, one JSON response per output line,
-//! diagnostics on stderr only. Reading continues until EOF, so a single-line
-//! invocation (one line, then closed stdin) still yields exactly one response and
-//! remains compatible with contract §5 ("one request per process invocation");
-//! the loop is kept because it costs one `for` and lets a client drive a whole
-//! session through a single process.
+//! Framing: the first complete JSON request line is the only request processed
+//! by this invocation. A newline terminates the request; EOF also terminates a
+//! final non-empty request line. The process responds without waiting for EOF.
+//! Subsequent input is never processed. The client does not have to close stdin.
+//! Exactly one JSON response line is written to stdout; diagnostics go to stderr.
 
 use std::io::{BufRead, Write};
 
 use ai_memory_adapter::{
     adapter::{AdapterError, MemoryAdapter, MemoryEntry, Query},
+    context::CharBudget,
     storage::{
         sqlite::{lexical_score, tokenize},
         SqliteStorage,
@@ -59,23 +59,26 @@ async fn main() {
         }
     };
 
-    let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     let mut storage = None;
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(error) => {
-                eprintln!("memory-stdio: stdin read failed: {error}");
-                break;
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
+    // Contract v0.1 is deliberately one request per process invocation: only the
+    // first request frame is read, and a second request is never executed.
+    let line = match read_request() {
+        Ok(line) => line,
+        Err(error) => {
+            eprintln!("memory-stdio: stdin read failed: {error}");
+            std::process::exit(1);
         }
+    };
 
-        let response = match serde_json::from_str::<Value>(&line) {
+    let response = if line.trim().is_empty() {
+        error_response(
+            "",
+            &Failure::new("INVALID_REQUEST", "one request line is required"),
+        )
+    } else {
+        match serde_json::from_str::<Value>(&line) {
             Ok(request) => handle(request, &db_path, &mut storage).await,
             Err(error) => error_response(
                 "",
@@ -84,23 +87,38 @@ async fn main() {
                     format!("request is not valid JSON: {error}"),
                 ),
             ),
-        };
-
-        let rendered = serde_json::to_string(&response).unwrap_or_else(|error| {
-            eprintln!("memory-stdio: response serialization failed: {error}");
-            String::from(
-                r#"{"contract_version":"0.1","request_id":"","ok":false,"error":{"code":"SERIALIZATION_ERROR","message":"response serialization failed","retryable":false}}"#,
-            )
-        });
-
-        if writeln!(stdout, "{rendered}")
-            .and_then(|()| stdout.flush())
-            .is_err()
-        {
-            eprintln!("memory-stdio: stdout write failed");
-            break;
         }
+    };
+
+    let rendered = serde_json::to_string(&response).unwrap_or_else(|error| {
+        eprintln!("memory-stdio: response serialization failed: {error}");
+        String::from(
+            r#"{"contract_version":"0.1","request_id":"","ok":false,"error":{"code":"SERIALIZATION_ERROR","message":"response serialization failed","retryable":false}}"#,
+        )
+    });
+
+    if writeln!(stdout, "{rendered}")
+        .and_then(|()| stdout.flush())
+        .is_err()
+    {
+        eprintln!("memory-stdio: stdout write failed");
+        std::process::exit(2);
     }
+}
+
+/// Reads exactly one request frame.
+///
+/// A newline terminates the request. EOF also terminates a
+/// final non-empty line. This function deliberately does not
+/// wait for EOF after a complete newline-terminated request.
+fn read_request() -> std::io::Result<String> {
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let mut line = String::new();
+
+    reader.read_line(&mut line)?;
+
+    Ok(line)
 }
 
 /// Resolves the SQLite path: `--db <path>` wins, `MA_SQLITE_PATH` is the fallback.
@@ -366,6 +384,27 @@ async fn retrieve(
         },
     };
 
+    // Optional output budget. Absent means "no truncation", which is exactly the
+    // pre-budget behaviour, so existing callers keep their results. Charging goes
+    // through the same `CharBudget` as context assembly so both agree on what fits.
+    let max_chars = match payload.get("max_chars") {
+        None | Some(Value::Null) => usize::MAX,
+        Some(value) => match value
+            .as_u64()
+            .and_then(|max| usize::try_from(max).ok())
+            .filter(|max| *max > 0)
+        {
+            Some(max) => max,
+            None => {
+                return Err(Failure::new(
+                    "INVALID_REQUEST",
+                    "max_chars must be a positive integer",
+                ))
+            }
+        },
+    };
+    let mut budget = CharBudget::new(max_chars);
+
     let query = Query {
         text: text.clone(),
         session_id,
@@ -379,6 +418,7 @@ async fn retrieve(
 
     let query_tokens = tokenize(&text);
     let mut rendered = Vec::with_capacity(entries.len());
+    let mut entries_omitted = 0;
     for entry in entries {
         // Fail closed: never return an entry that escaped the requested scope.
         if entry.work_item_id.as_deref() != Some(work_item_id.as_str()) {
@@ -399,6 +439,11 @@ async fn retrieve(
             created_at,
             ..
         } = entry;
+        // Budget is measured on returned content characters, not on JSON bytes.
+        if !budget.admit(content.chars().count()) {
+            entries_omitted += 1;
+            continue;
+        }
         rendered.push(json!({
             "memory_id": id.to_string(),
             "work_item_id": work_item_id,
@@ -406,8 +451,12 @@ async fn retrieve(
             "content": content,
             "provenance": metadata
                 .pointer("/_so_contract/provenance")
+                .filter(|value| value.is_object())
                 .cloned()
-                .unwrap_or(Value::Null),
+                // Contract §10: `provenance` is an object. A record written
+                // outside this binary carries no SO provenance; `{}` keeps the
+                // field's shape instead of leaking a `null`.
+                .unwrap_or_else(|| json!({})),
             "created_at": created_at.to_rfc3339_opts(SecondsFormat::Secs, true),
             "score": score,
         }));
@@ -417,7 +466,7 @@ async fn retrieve(
     Ok(json!({
         "entries": rendered,
         "entries_included": entries_included,
-        "entries_omitted": 0,
+        "entries_omitted": entries_omitted,
     }))
 }
 
