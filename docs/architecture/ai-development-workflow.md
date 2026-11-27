@@ -40,20 +40,40 @@
 - `--tail <conv_id>` 收割末条回复
 - 失败重试：413 → 精简包 + 新会话；thinking 失控 → 纯文本模式
 
+## 2.1 载体与术语边界
+
+以下概念必须保持分离：
+
+| 概念 | 权威含义 | 当前持久化/状态 |
+|---|---|---|
+| **GitHub Issue** | 需求、缺陷、范围、状态和治理讨论的系统记录 | GitHub 是唯一状态权威；不得把 Issue 状态复制到记忆作为第二事实源 |
+| **Session Ops WorkItem** | 一个有边界的执行连续性聚合，可跨多个 Session | 当前 SO schema 仅有 `work_item_id`、`status`、`created_at`、`updated_at`；owner/tenant 另存于 authority 表；没有结构化 GitHub Issue 引用 |
+| **Session** | 一次实际 ChatGPT 对话/执行实例 | 通过 SessionLink 关联 WorkItem；SessionLink 是身份/生命周期关系，不是角色分配 |
+| **Work Unit** | 可独立交接的自包含 prompt/任务包 | 是交接文档，不是数据库 WorkItem，也不是新的权限载体 |
+| **Assignment（目标设计）** | 把 WorkItem 分配给 worker/reviewer/owner/coordinator 角色及对应 Session | 当前不存在持久化 Assignment 记录；属于待审查设计，不得描述为已实现 |
+
+**建议的关联契约（尚未实现）：** 每个开发 WorkItem 指向一个主 GitHub Issue，使用
+`repository_full_name + issue_number` 作为规范键；URL 可派生。一个 Issue
+可以拆成多个执行 WorkItem。PR、commit、CI run、review 和 Owner decision
+作为带类型的证据引用关联到 WorkItem。GitHub Issue 的 title/body/state
+仍只由 GitHub 管理，WorkItem 不复制或覆盖这些状态。
+
 ## 3. 角色分工与授权
 
-| 角色 | 承担者 | 职责 | 失败策略 |
+| 角色 | 承担者 | 职责 | 证据/限制 |
 |---|---|---|---|
-| **Session Ops Owner** | ChatGPT 会话 | 授权裁决、验收、合并批准 | NEEDS_REVISION / REJECT |
-| **实施者** | ChatGPT 会话 | 代码修改、测试编写 | BLOCKED 范围外改动 |
-| **独立 Reviewer** | 独立 ChatGPT 会话 | 读 diff、对照范围、审查结论 | REQUEST_CHANGES / NEEDS_MORE_EVIDENCE |
-| **协调 AI** | WorkBuddy | 拆解任务、投递/收割、GitHub 回写、证据核验 | 核验失败不接受文字汇报 |
+| **Owner / 验收权威** | 由治理记录明确授权的主体；可与协调角色共置 | 范围裁定、验收、合并/部署授权 | 权限来自权威治理记录，不来自 ChatGPT 会话自述 |
+| **实施者（worker）** | 被分配的执行 Session | 实施、测试、提交证据 | 绑定 WorkItem、Session 和 prompt provenance |
+| **独立 Reviewer** | 与实施者不同的 Session | 审查 diff、测试和验收证据 | 必须绑定被审查的精确 head SHA 和独立 prompt provenance |
+| **协调者（coordinator）** | WorkBuddy 或 ChatGPT 会话 | 分解、派发、收集、核验、升级阻塞 | 不因协调职责自动获得 Owner 或合并权限 |
 
 **关键约束：**
-- 实施者不能自兼独立 Reviewer
-- 所有裁决绑定精确 Commit SHA
-- Issue #2 的规划建议不构成实施授权
-- 跨仓库/跨工作项授权不可继承
+- Owner 与 coordinator 可以共置，但共置不会产生 Owner 权限；必须有独立、可追溯的授权来源。
+- worker 不得自兼独立 Reviewer。Reviewer 必须使用不同 Session 和不同 prompt digest；GitHub 登录账号是否相同不是独立性的判据。
+- 所有审查与裁决绑定精确 Commit/PR head SHA；PR head 变化后，旧审查不自动适用。
+- GitHub Issue、Session Ops WorkItem、Session 和 Work Unit 是不同载体，不得互相冒充。
+- 记忆只提供历史上下文，不授予权限、不指定 Owner、不满足验收或合并门禁。
+- 跨仓库/跨 WorkItem 授权不可继承。
 
 ## 4. GitHub 证据闭环
 
@@ -142,21 +162,47 @@ rebase 和 squash 后，必须核对原 PR 变更是否完整保留。无冲突�
 | 锁获取失败 | TimeoutError / OSError | fail-closed（P1-01），调用方决定重试 |
 | 执行 AI 回报不可信 | GitHub 实测 | 核验 Commit/PR/测试，不接受纯文字 |
 
-## 7. 能力状态
+## 7. 能力状态（证据快照：2026-11-28）
 
-| 能力 | 状态 | 说明 |
+状态定义：**SUPPORTED** = 当前基线存在可观察实现和对应测试/运行证据；
+**PARTIAL** = 仅覆盖部分链路或仍有关键证据/授权缺口；
+**MISSING** = 当前基线不存在该持久化能力/服务；
+**NOT_VERIFIED** = 缺少足以作出判断的验收证据；
+**NOT_AUTHORIZED** = 没有生产/高风险操作授权。状态只适用于表中明确的范围。
+
+| 能力 | 状态 | 当前证据与边界 |
 |---|---|---|
-| P1-01 文件锁 fail-closed | **已实现** | 合并于 f6a0434，104/104 测试通过 |
-| ChatGPT 会话投递/收割 | **已实现** | --new / 续接 / --tail，账号轮转 |
-| GitHub 证据闭环 | **已实现** | Issue/PR/Commit/Review/验收可追溯 |
-| 独立审查 | **已实现** | 独立会话、SHA 绑定、逐项判定 |
-| Owner 授权裁决 | **已实现** | ChatGPT 会话承担，结构化输出 |
-| 会话续接与恢复 | **已实现** | conv_id 续接、匿名会话补救 |
-| 工作流架构文档 | **本文档** | 首版 |
-| P1-02 中文检索优化 | **计划中** | 需新 Owner 决策 |
-| P1-03 时间偏置基准 | **计划中** | 需新 Owner 决策 |
-| 跨仓库记忆共享 | **实验中** | Adapter 实验，未生产验证 |
-| 生产部署 | **未验证** | 测试通过≠生产可用 |
+| P1-01 文件锁 fail-closed | **SUPPORTED（限本地工具）** | 历史记录指向 `f6a0434` 和 104/104 测试；这只证明对应本地锁行为，不证明整个 AI 开发生态闭环 |
+| ChatGPT 会话投递/收割 | **PARTIAL** | 存在 `--new`、`conv_id` 续接和 `--tail` 等旧工具；排队成功只证明任务已持久化，不代表远端会话已回答。账号轮转、匿名回退及挑战处理不属于已批准的 MCP/试点能力 |
+| GitHub 证据闭环 | **PARTIAL** | GitHub 可承载 Issue/PR/Commit/Review，但 SO WorkItem 尚无结构化主 Issue 引用，prompt→commit provenance 未达到端到端可追溯 |
+| 独立审查 | **PARTIAL** | 可以使用不同 Session 和精确 SHA 审查；但没有持久化 Assignment，也没有已验证的 worker/reviewer prompt-pair provenance。PR #34 当前无 review 记录 |
+| Owner 授权裁决 | **NOT_VERIFIED** | Owner 权限必须来自 AiMemoryBrainArchitecture 的权威治理记录；ChatGPT Session 的自述或结构化文本不能自授权限。当前 WorkItem 不持久化 Owner assignment/decision reference |
+| 会话续接与恢复 | **PARTIAL** | Session ID、SessionLink 和续接工具存在；没有获批的真实 Session A/B 价值试点，不能将工具可用性等同于经验证的连续工作能力 |
+| SO MCP | **SUPPORTED（当前工具边界）** | SO main 有 JWT 验证、scope 检查、Principal/Tenant/WorkItem 授权和 10 个 MCP 工具；`session.context` 只通过授权的 active SessionLink 派生 WorkItem |
+| Adapter JSONL 首帧单请求 | **SUPPORTED（实现/测试/CI）** | 当前 main 的 `memory-stdio.rs` 只读取首个请求行；协议测试覆盖第二请求不执行、EOF 终止和空输入；PR #40 的文档专用 CI 分支未改源码，已对该 main 代码树运行 build/test/clippy/fmt/ignored rollback 并全部通过 |
+| Adapter JSONL 硬资源边界 | **MISSING** | 当前首帧读取仍无请求行字节上限；Core 内容/metadata/result count/序列化响应缺少硬上限；`max_chars` 只限制内容字符预算 |
+| SO→Adapter 直接检索 | **PARTIAL** | `mcp_server.py` 的 `session.context` 经授权 active link 调用 `MemoryAdapterClient.retrieve`；当前生产路径没有发现 `MemoryAdapterClient.store` 调用，不能宣称完整记忆写入闭环 |
+| Adapter MCP | **MISSING** | Adapter main 没有 first-class MCP server；实现目标仍在 Adapter #25，远程 MCP 的 Principal→Tenant→WorkItem 授权协议未冻结 |
+| WorkItem→GitHub Issue 关联 | **MISSING** | SO WorkItem schema 仅含 ID/status/timestamps；没有规范化 repository+issue number 主引用 |
+| WorkItem 角色分配与 prompt provenance | **MISSING** | 没有持久化 Assignment；SessionLink 不能代替 worker/reviewer/Owner 角色分配 |
+| 真实跨会话 A/B 试点 | **NOT_VERIFIED / BLOCKED** | AiMemoryBrainArchitecture #458 要求单独实验计划与 Owner 批准；当前没有获批的真实 Session A/B 试点 |
+| P1-02 中文检索优化 | **NOT_VERIFIED** | 仍需独立范围和 Owner 决策 |
+| P1-03 时间偏置基准 | **NOT_VERIFIED** | 仍需独立范围和 Owner 决策 |
+| 生产部署/生产数据接入 | **NOT_AUTHORIZED** | #458 明确不包含生产部署、生产数据接入或生产激活授权 |
+
+### 7.1 证据解释与未决度量
+
+- SO 基线：`25882441ddb1d23bea355737653f6fc09c1068ed`；Adapter main 基线：`3c39f22f6b1c0b6b75a35008afe5970f01718ba0`。
+- SO 直接检索证据：`src/session_ops/mcp_server.py`、`src/session_ops/authority.py`、`src/session_ops/mcp_auth.py`、`src/session_ops/memory_adapter_client.py`。
+- Adapter stdio 证据：当前 GitHub main `2ceeb566f433a8d08f3cb5f5dea46b7da811f9aa` 的 `src/bin/memory-stdio.rs` 使用单次 `read_line` 读取首个请求；`tests/stdio_protocol.rs` 包含 `multiple_request_lines_only_process_the_first`、`eof_terminated_request_is_processed` 和 `empty_stdin_returns_one_invalid_request_response`。代码与测试已体现首帧单请求语义；blank-first-line 尚无独立测试。
+- 本地 VM 的 Adapter checkout 仍停留在 `3c39f22f6b1c0b6b75a35008afe5970f01718ba0`。本轮本地运行的 19/19 协议测试属于旧 checkout，不能作为当前 main 的验证证据。当前 main 代码树由文档专用 PR #40 的 CI run `46058852294` 验证（该 PR 不改源码）：cargo build、cargo test、clippy、fmt check 和 ignored SQLite rollback tests 全部 PASS。
+- Adapter main 契约 blob 为 `f2e657a21cd7aaa619c8282477e372741a0ff8a5`；SO main 镜像仍为旧版 blob `e53532f9793081d8e086caef7b235c09d5bf0e34`。Adapter 文档已含首帧 framing、`max_chars` 与 `entries_omitted` 语义，但 null 行为、硬字节边界和 provenance 规范化仍需精确补齐；SO 配对文档 PR #170 正在同步。
+- Adapter #35 的原始审计基线是旧 main `3c39f22`，其“多行请求均执行”结论对当前 main 已过期；必须按当前 `2ceeb566` 重新裁定 Issue 状态，不可继续把旧 Issue 正文当作当前代码事实。PR #34 的 review 查询在本轮返回 0 条 review/inline thread；这不等于 PR 已获独立审查。
+- REQ-04 #265 将 prompt→commit traceability 记为 PARTIAL、attention/context-switch cost 记为 ABSENT。该 Issue 当前记录的 manifest 双字段统计与 #37 使用的 TRACEABLE 统计口径不同；在统一分母、谓词和测量时间前，不应把任一数字包装为端到端覆盖率。
+- REQ-12 #345 最新记录为 1 SATISFIED / 10 PARTIALLY-SATISFIED / 1 NOT-DEMONSTRATED；reviewer Session 分离已有记录，但 prompt-pair provenance 仍未验证。
+- Adapter #36 与 SO #165 追踪 JSONL 输入/内容/元数据/响应及 subprocess stdout/stderr 的硬字节上限。字符预算 `max_chars` 不是硬字节上限。
+- Adapter #37、SO #166、AiMemoryBrainArchitecture #458 是本节状态与术语的配对治理载体。这里的目标设计不代表 schema 变更已经获批。
+
 
 ## 8. 变更记录
 
@@ -164,3 +210,4 @@ rebase 和 squash 后，必须核对原 PR 变更是否完整保留。无冲突�
 |---|---|---|
 | 2026-11-20 | 首版文档创建 | — |
 | 2026-11-20 | 增加 rebase / squash 变更清单核对门禁 | — |
+| 2026-11-28 | 按 Adapter #37 / SO #166 / Ecosystem #458 重分类能力状态并澄清 Issue、WorkItem、Session、Work Unit 与角色授权边界 | — |
