@@ -179,7 +179,7 @@ rebase 和 squash 后，必须核对原 PR 变更是否完整保留。无冲突�
 | Owner 授权裁决 | **NOT_VERIFIED** | Owner 权限必须来自 AiMemoryBrainArchitecture 的权威治理记录；ChatGPT Session 的自述或结构化文本不能自授权限。当前 WorkItem 不持久化 Owner assignment/decision reference |
 | 会话续接与恢复 | **PARTIAL** | Session ID、SessionLink 和续接工具存在；没有获批的真实 Session A/B 价值试点，不能将工具可用性等同于经验证的连续工作能力 |
 | SO MCP | **SUPPORTED（当前工具边界）** | SO main 有 JWT 验证、scope 检查、Principal/Tenant/WorkItem 授权和 10 个 MCP 工具；`session.context` 只通过授权的 active SessionLink 派生 WorkItem |
-| Adapter JSONL 首帧单请求 | **SUPPORTED（实现/测试存在；CI NOT_VERIFIED）** | 当前 main 的 `memory-stdio.rs` 只读取首个请求行；协议测试覆盖第二请求不执行、EOF 终止和空输入 |
+| Adapter JSONL 首帧单请求 | **SUPPORTED（实现/测试/CI）** | 当前 main 的 `memory-stdio.rs` 只读取首个请求行；协议测试覆盖第二请求不执行、EOF 终止和空输入；PR #40 的文档专用 CI 分支未改源码，已对该 main 代码树运行 build/test/clippy/fmt/ignored rollback 并全部通过 |
 | Adapter JSONL 硬资源边界 | **MISSING** | 当前首帧读取仍无请求行字节上限；Core 内容/metadata/result count/序列化响应缺少硬上限；`max_chars` 只限制内容字符预算 |
 | SO→Adapter 直接检索 | **PARTIAL** | `mcp_server.py` 的 `session.context` 经授权 active link 调用 `MemoryAdapterClient.retrieve`；当前生产路径没有发现 `MemoryAdapterClient.store` 调用，不能宣称完整记忆写入闭环 |
 | Adapter MCP | **MISSING** | Adapter main 没有 first-class MCP server；实现目标仍在 Adapter #25，远程 MCP 的 Principal→Tenant→WorkItem 授权协议未冻结 |
@@ -195,7 +195,7 @@ rebase 和 squash 后，必须核对原 PR 变更是否完整保留。无冲突�
 - SO 基线：`25882441ddb1d23bea355737653f6fc09c1068ed`；Adapter main 基线：`3c39f22f6b1c0b6b75a35008afe5970f01718ba0`。
 - SO 直接检索证据：`src/session_ops/mcp_server.py`、`src/session_ops/authority.py`、`src/session_ops/mcp_auth.py`、`src/session_ops/memory_adapter_client.py`。
 - Adapter stdio 证据：当前 GitHub main `2ceeb566f433a8d08f3cb5f5dea46b7da811f9aa` 的 `src/bin/memory-stdio.rs` 使用单次 `read_line` 读取首个请求；`tests/stdio_protocol.rs` 包含 `multiple_request_lines_only_process_the_first`、`eof_terminated_request_is_processed` 和 `empty_stdin_returns_one_invalid_request_response`。代码与测试已体现首帧单请求语义；blank-first-line 尚无独立测试。
-- 本地 VM 的 Adapter checkout 仍停留在 `3c39f22f6b1c0b6b75a35008afe5970f01718ba0`。本轮本地运行的 19/19 协议测试属于旧 checkout，不能作为当前 main 的验证证据。对当前 main SHA `2ceeb566`，本轮未取得可确认的 GitHub Actions run 或 combined status；CI 状态为 NOT_VERIFIED。
+- 本地 VM 的 Adapter checkout 仍停留在 `3c39f22f6b1c0b6b75a35008afe5970f01718ba0`。本轮本地运行的 19/19 协议测试属于旧 checkout，不能作为当前 main 的验证证据。当前 main 代码树由文档专用 PR #40 的 CI run `46058852294` 验证（该 PR 不改源码）：cargo build、cargo test、clippy、fmt check 和 ignored SQLite rollback tests 全部 PASS。
 - Adapter main 契约 blob 为 `f2e657a21cd7aaa619c8282477e372741a0ff8a5`；SO main 镜像仍为旧版 blob `e53532f9793081d8e086caef7b235c09d5bf0e34`。Adapter 文档已含首帧 framing、`max_chars` 与 `entries_omitted` 语义，但 null 行为、硬字节边界和 provenance 规范化仍需精确补齐；SO 配对文档 PR #170 正在同步。
 - Adapter #35 的原始审计基线是旧 main `3c39f22`，其“多行请求均执行”结论对当前 main 已过期；必须按当前 `2ceeb566` 重新裁定 Issue 状态，不可继续把旧 Issue 正文当作当前代码事实。PR #34 的 review 查询在本轮返回 0 条 review/inline thread；这不等于 PR 已获独立审查。
 - REQ-04 #265 将 prompt→commit traceability 记为 PARTIAL、attention/context-switch cost 记为 ABSENT。该 Issue 当前记录的 manifest 双字段统计与 #37 使用的 TRACEABLE 统计口径不同；在统一分母、谓词和测量时间前，不应把任一数字包装为端到端覆盖率。
