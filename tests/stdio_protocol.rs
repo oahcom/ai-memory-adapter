@@ -606,18 +606,207 @@ fn max_chars_bounds_the_returned_entries() {
     assert_eq!(bounded["result"]["entries_omitted"], 1);
 }
 
+/// Contract §9: max_chars counts Unicode scalar values, not UTF-8 bytes.
+/// Entries are either included whole or omitted whole; content is never truncated.
 #[test]
-fn non_positive_max_chars_is_rejected() {
+fn retrieve_max_chars_counts_unicode_scalars() {
+    let db = database_path("unicode-scalars");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    let content = "中🙂";
+
+    assert_eq!(content.chars().count(), 2);
+    assert_eq!(content.len(), 7);
+
+    invoke(
+        &db,
+        &store_request("req_unicode_store", &item, "session-unicode", content),
+    );
+
+    let mut exact_request: Value =
+        serde_json::from_str(&retrieve_request("req_unicode_exact", &item, None))
+            .expect("retrieve request is JSON");
+
+    exact_request["payload"]["max_chars"] = Value::from(2);
+
+    let exact = response(&invoke(&db, &exact_request.to_string()));
+
+    let exact_entries = exact["result"]["entries"]
+        .as_array()
+        .expect("entries must be an array");
+
+    assert_eq!(
+        exact_entries.len(),
+        1,
+        "two Unicode scalar values must fit budget 2"
+    );
+    assert_eq!(
+        exact_entries[0]["content"], content,
+        "accepted content must remain completely unchanged"
+    );
+    assert_eq!(exact["result"]["entries_included"], 1);
+    assert_eq!(exact["result"]["entries_omitted"], 0);
+
+    let mut insufficient_request: Value =
+        serde_json::from_str(&retrieve_request("req_unicode_short", &item, None))
+            .expect("retrieve request is JSON");
+
+    insufficient_request["payload"]["max_chars"] = Value::from(1);
+
+    let insufficient = response(&invoke(&db, &insufficient_request.to_string()));
+
+    let insufficient_entries = insufficient["result"]["entries"]
+        .as_array()
+        .expect("entries must be an array");
+
+    assert!(
+        insufficient_entries.is_empty(),
+        "a two-scalar entry must not be partially returned under budget 1"
+    );
+    assert_eq!(insufficient["result"]["entries_included"], 0);
+    assert_eq!(insufficient["result"]["entries_omitted"], 1);
+}
+
+/// Contract §9: max_chars is an aggregate budget over complete entries.
+/// The budget counts Unicode scalar values, accepts exact boundaries,
+/// and never truncates content.
+#[test]
+fn retrieve_max_chars_obeys_entry_budget_boundaries() {
+    // ASCII exact boundary: "abc" fits budget 3.
+    {
+        let db = database_path("budget-ascii-exact");
+        let _cleanup = Removal(db.clone());
+        let item = work_item();
+
+        invoke(&db, &store_request("req_a1", &item, "session-a", "abc"));
+
+        let mut request: Value = serde_json::from_str(&retrieve_request("req_a2", &item, None))
+            .expect("retrieve request is JSON");
+        request["payload"]["max_chars"] = Value::from(3);
+
+        let result = response(&invoke(&db, &request.to_string()));
+
+        assert_eq!(
+            result["result"]["entries"].as_array().map(Vec::len),
+            Some(1),
+            "ASCII content of length 3 must fit budget 3"
+        );
+        assert_eq!(result["result"]["entries"][0]["content"], "abc");
+        assert_eq!(result["result"]["entries_included"], 1);
+        assert_eq!(result["result"]["entries_omitted"], 0);
+    }
+
+    // ASCII over budget: "abcd" does not fit budget 3.
+    {
+        let db = database_path("budget-ascii-over");
+        let _cleanup = Removal(db.clone());
+        let item = work_item();
+
+        invoke(&db, &store_request("req_b1", &item, "session-b", "abcd"));
+
+        let mut request: Value = serde_json::from_str(&retrieve_request("req_b2", &item, None))
+            .expect("retrieve request is JSON");
+        request["payload"]["max_chars"] = Value::from(3);
+
+        let result = response(&invoke(&db, &request.to_string()));
+
+        assert!(
+            result["result"]["entries"].as_array().unwrap().is_empty(),
+            "ASCII content of length 4 must be omitted under budget 3"
+        );
+        assert_eq!(result["result"]["entries_included"], 0);
+        assert_eq!(result["result"]["entries_omitted"], 1);
+    }
+
+    // Exact cumulative boundary: "ab" + "cd" consumes exactly 4.
+    {
+        let db = database_path("budget-cumulative-exact");
+        let _cleanup = Removal(db.clone());
+        let item = work_item();
+
+        invoke(&db, &store_request("req_d1", &item, "session-d", "ab"));
+        invoke(&db, &store_request("req_d2", &item, "session-d", "cd"));
+
+        let mut request: Value = serde_json::from_str(&retrieve_request("req_d3", &item, None))
+            .expect("retrieve request is JSON");
+        request["payload"]["max_chars"] = Value::from(4);
+
+        let result = response(&invoke(&db, &request.to_string()));
+
+        assert_eq!(
+            result["result"]["entries"].as_array().map(Vec::len),
+            Some(2),
+            "two entries totaling exactly 4 characters must both fit"
+        );
+        assert_eq!(result["result"]["entries_included"], 2);
+        assert_eq!(result["result"]["entries_omitted"], 0);
+    }
+
+    // Cumulative over budget: "ab" fits, but adding "cde" exceeds 4.
+    // "cde" is stored first so that "ab" is returned first deterministically.
+    {
+        let db = database_path("budget-cumulative-over");
+        let _cleanup = Removal(db.clone());
+        let item = work_item();
+
+        invoke(&db, &store_request("req_e1", &item, "session-e", "cde"));
+        invoke(&db, &store_request("req_e2", &item, "session-e", "ab"));
+
+        let mut request: Value = serde_json::from_str(&retrieve_request("req_e3", &item, None))
+            .expect("retrieve request is JSON");
+        request["payload"]["max_chars"] = Value::from(4);
+
+        let result = response(&invoke(&db, &request.to_string()));
+
+        let entries = result["result"]["entries"]
+            .as_array()
+            .expect("entries must be an array");
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the first two-character entry must fit before the second exceeds budget"
+        );
+        assert_eq!(
+            entries[0]["content"], "ab",
+            "the first entry must be retained whole"
+        );
+        assert_eq!(result["result"]["entries_included"], 1);
+        assert_eq!(result["result"]["entries_omitted"], 1);
+    }
+}
+
+/// Contract §9: max_chars must be a strictly positive integer.
+/// Floats, booleans, strings, zero, and negative values are invalid.
+#[test]
+fn non_positive_or_non_integer_max_chars_is_rejected() {
     let db = database_path("max-chars-invalid");
     let _cleanup = Removal(db.clone());
     let item = work_item();
 
-    for bad in [Value::from(0), Value::from(-5), Value::from("many")] {
-        let mut request: Value = serde_json::from_str(&retrieve_request("req_e", &item, None))
-            .expect("retrieve request is JSON");
+    let invalid_values = [
+        ("zero", Value::from(0)),
+        ("negative", Value::from(-1)),
+        ("fractional", serde_json::json!(1.5)),
+        ("boolean", Value::Bool(true)),
+        ("string", Value::String("2".to_owned())),
+    ];
+
+    for (label, bad) in invalid_values {
+        let mut request: Value =
+            serde_json::from_str(&retrieve_request("req_invalid", &item, None))
+                .expect("retrieve request is JSON");
+
         request["payload"]["max_chars"] = bad.clone();
+
         let parsed = response(&invoke(&db, &request.to_string()));
-        assert_eq!(error_code(&parsed), "INVALID_REQUEST", "max_chars {bad}");
+
+        assert_eq!(
+            error_code(&parsed),
+            "INVALID_REQUEST",
+            "max_chars {label} ({bad}) must be rejected"
+        );
     }
 }
 
