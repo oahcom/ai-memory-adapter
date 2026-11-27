@@ -272,3 +272,36 @@ impl<'a> ContextInjector<'a> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CharBudget;
+
+    #[test]
+    fn admit_zero_length_entry_with_zero_budget() {
+        let mut budget = CharBudget::new(0);
+
+        assert!(budget.admit(0));
+        assert_eq!(budget.used(), 0);
+
+        assert!(!budget.admit(1));
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn admit_zero_length_entry_does_not_consume_remaining_budget() {
+        let mut budget = CharBudget::new(2);
+
+        assert!(budget.admit(0));
+        assert_eq!(budget.used(), 0);
+
+        assert!(budget.admit(2));
+        assert_eq!(budget.used(), 2);
+
+        assert!(budget.admit(0));
+        assert_eq!(budget.used(), 2);
+
+        assert!(!budget.admit(1));
+        assert_eq!(budget.used(), 2);
+    }
+}

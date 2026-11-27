@@ -353,6 +353,8 @@ several Sessions inside that WorkItem:
   }
 }
 
+`entries_omitted` counts only entries excluded because they do not fit the aggregate `max_chars` character budget. It does not include entries omitted by the `limit` result-count cap. In other words, entries not returned because the result set was truncated by `limit` are not counted in `entries_omitted`.
+
 An empty entries array is a successful result.
 
 The score represents the MA retrieval score.
