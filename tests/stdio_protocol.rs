@@ -573,6 +573,53 @@ fn empty_retrieval_is_a_successful_result() {
 }
 
 #[test]
+fn max_chars_bounds_the_returned_entries() {
+    let db = database_path("max-chars");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    invoke(
+        &db,
+        &store_request("req_a", &item, "session-001", "migration completed alpha"),
+    );
+    invoke(
+        &db,
+        &store_request("req_b", &item, "session-001", "migration completed beta"),
+    );
+
+    // Absent max_chars keeps the old behaviour: nothing is omitted.
+    let unbounded = response(&invoke(&db, &retrieve_request("req_c", &item, None)));
+    assert_eq!(
+        unbounded["result"]["entries"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(unbounded["result"]["entries_omitted"], 0);
+
+    // "migration completed alpha" is 25 characters, "... beta" is 24.
+    let mut request: Value = serde_json::from_str(&retrieve_request("req_d", &item, None))
+        .expect("retrieve request is JSON");
+    request["payload"]["max_chars"] = Value::from(24);
+    let bounded = response(&invoke(&db, &request.to_string()));
+    assert_eq!(bounded["result"]["entries_included"], 1);
+    assert_eq!(bounded["result"]["entries_omitted"], 1);
+}
+
+#[test]
+fn non_positive_max_chars_is_rejected() {
+    let db = database_path("max-chars-invalid");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    for bad in [Value::from(0), Value::from(-5), Value::from("many")] {
+        let mut request: Value = serde_json::from_str(&retrieve_request("req_e", &item, None))
+            .expect("retrieve request is JSON");
+        request["payload"]["max_chars"] = bad.clone();
+        let parsed = response(&invoke(&db, &request.to_string()));
+        assert_eq!(error_code(&parsed), "INVALID_REQUEST", "max_chars {bad}");
+    }
+}
+
+#[test]
 fn multiple_request_lines_are_rejected_before_any_operation_runs() {
     let db = database_path("single-request");
     let _cleanup = Removal(db.clone());

@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use ai_memory_adapter::{
     adapter::{AdapterError, MemoryAdapter, MemoryEntry, Query},
+    context::CharBudget,
     storage::{
         sqlite::{lexical_score, tokenize},
         SqliteStorage,
@@ -432,6 +433,27 @@ async fn retrieve(
         },
     };
 
+    // Optional output budget. Absent means "no truncation", which is exactly the
+    // pre-budget behaviour, so existing callers keep their results. Charging goes
+    // through the same `CharBudget` as context assembly so both agree on what fits.
+    let max_chars = match payload.get("max_chars") {
+        None | Some(Value::Null) => usize::MAX,
+        Some(value) => match value
+            .as_u64()
+            .and_then(|max| usize::try_from(max).ok())
+            .filter(|max| *max > 0)
+        {
+            Some(max) => max,
+            None => {
+                return Err(Failure::new(
+                    "INVALID_REQUEST",
+                    "max_chars must be a positive integer",
+                ))
+            }
+        },
+    };
+    let mut budget = CharBudget::new(max_chars);
+
     let query = Query {
         text: text.clone(),
         session_id,
@@ -445,6 +467,7 @@ async fn retrieve(
 
     let query_tokens = tokenize(&text);
     let mut rendered = Vec::with_capacity(entries.len());
+    let mut entries_omitted = 0;
     for entry in entries {
         // Fail closed: never return an entry that escaped the requested scope.
         if entry.work_item_id.as_deref() != Some(work_item_id.as_str()) {
@@ -465,6 +488,11 @@ async fn retrieve(
             created_at,
             ..
         } = entry;
+        // Budget is measured on returned content characters, not on JSON bytes.
+        if !budget.admit(content.chars().count()) {
+            entries_omitted += 1;
+            continue;
+        }
         rendered.push(json!({
             "memory_id": id.to_string(),
             "work_item_id": work_item_id,
@@ -483,7 +511,7 @@ async fn retrieve(
     Ok(json!({
         "entries": rendered,
         "entries_included": entries_included,
-        "entries_omitted": 0,
+        "entries_omitted": entries_omitted,
     }))
 }
 
