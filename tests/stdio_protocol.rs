@@ -573,8 +573,8 @@ fn empty_retrieval_is_a_successful_result() {
 }
 
 #[test]
-fn multiple_requests_in_one_process_produce_one_response_each() {
-    let db = database_path("batch");
+fn multiple_request_lines_are_rejected_before_any_operation_runs() {
+    let db = database_path("single-request");
     let _cleanup = Removal(db.clone());
     let item = work_item();
 
@@ -583,20 +583,66 @@ fn multiple_requests_in_one_process_produce_one_response_each() {
         store_request("req_001", &item, "session-001", "migration completed"),
         retrieve_request("req_002", &item, None)
     );
-    let outcome = invoke(&db, &input);
+    let rejected = response(&invoke(&db, &input));
 
-    let responses: Vec<Value> = outcome
-        .stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("each line is JSON"))
-        .collect();
-    assert_eq!(responses.len(), 2, "one response per request line");
-    assert_eq!(responses[0]["request_id"], "req_001");
-    assert_eq!(responses[1]["request_id"], "req_002");
+    assert_eq!(error_code(&rejected), "INVALID_REQUEST");
+    assert_eq!(rejected["request_id"], "req_001");
+
+    // The first Store must not have run before the extra line was rejected.
+    let retrieved = response(&invoke(&db, &retrieve_request("req_003", &item, None)));
+    assert_eq!(retrieved["request_id"], "req_003");
     assert_eq!(
-        responses[1]["result"]["entries"].as_array().map(Vec::len),
-        Some(1)
+        retrieved["result"]["entries"].as_array().map(Vec::len),
+        Some(0)
     );
-    assert_eq!(outcome.code, 0);
+}
+
+#[test]
+fn empty_stdin_returns_one_invalid_request_response() {
+    let db = database_path("empty-stdin");
+    let _cleanup = Removal(db.clone());
+
+    let parsed = response(&invoke(&db, ""));
+    assert_eq!(error_code(&parsed), "INVALID_REQUEST");
+}
+
+/// Contract §5 is one request per invocation, but a client that keeps stdin
+/// open must still get its answer: the read must not wait for EOF.
+#[test]
+fn request_is_answered_without_closing_stdin() {
+    let db = database_path("open-stdin");
+    let _cleanup = Removal(db.clone());
+    let item = work_item();
+
+    let mut child = Command::new(binary())
+        .arg("--db")
+        .arg(&db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary must start");
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    stdin
+        .write_all(retrieve_request("req_open", &item, None).as_bytes())
+        .expect("request must be writable");
+    stdin.flush().expect("request must be flushed");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("the process must answer without waiting for stdin EOF")
+        .expect("binary must exit");
+    // stdin stays open until here, so the answer above cannot have needed EOF.
+    drop(stdin);
+
+    let parsed = response(&Outcome {
+        stdout: String::from_utf8(output.stdout).expect("stdout is UTF-8"),
+        stderr: String::from_utf8(output.stderr).expect("stderr is UTF-8"),
+        code: output.status.code().expect("exit code"),
+    });
+    assert_eq!(parsed["request_id"], "req_open");
 }

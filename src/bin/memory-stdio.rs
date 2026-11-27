@@ -2,14 +2,15 @@
 //!
 //! Invocation: `memory-stdio --db <path>`; `MA_SQLITE_PATH` is the fallback.
 //!
-//! Framing: one JSON request per input line, one JSON response per output line,
-//! diagnostics on stderr only. Reading continues until EOF, so a single-line
-//! invocation (one line, then closed stdin) still yields exactly one response and
-//! remains compatible with contract §5 ("one request per process invocation");
-//! the loop is kept because it costs one `for` and lets a client drive a whole
-//! session through a single process.
+//! Framing: exactly one JSON request line per process invocation, exactly one
+//! JSON response line on stdout, and diagnostics on stderr only. The client does
+//! not have to close stdin: the first line is answered as soon as it arrives.
+//! Additional non-whitespace input is rejected before any operation runs, in
+//! accordance with contract §5.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use ai_memory_adapter::{
     adapter::{AdapterError, MemoryAdapter, MemoryEntry, Query},
@@ -59,23 +60,41 @@ async fn main() {
         }
     };
 
-    let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     let mut storage = None;
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(error) => {
-                eprintln!("memory-stdio: stdin read failed: {error}");
-                break;
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
+    // Contract v0.1 is deliberately one request per process invocation.
+    // Reject extra non-whitespace input before executing anything, rather than
+    // silently dropping a caller's second request after committing the first.
+    let (line, extra_input) = match read_request() {
+        Ok(read) => read,
+        Err(error) => {
+            eprintln!("memory-stdio: stdin read failed: {error}");
+            std::process::exit(2);
         }
+    };
 
-        let response = match serde_json::from_str::<Value>(&line) {
+    let response = if extra_input {
+        let request_id = serde_json::from_str::<Value>(&line)
+            .ok()
+            .and_then(|request| {
+                request
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        error_response(
+            &request_id,
+            &Failure::new("INVALID_REQUEST", "exactly one request line is allowed"),
+        )
+    } else if line.trim().is_empty() {
+        error_response(
+            "",
+            &Failure::new("INVALID_REQUEST", "one request line is required"),
+        )
+    } else {
+        match serde_json::from_str::<Value>(&line) {
             Ok(request) => handle(request, &db_path, &mut storage).await,
             Err(error) => error_response(
                 "",
@@ -84,23 +103,70 @@ async fn main() {
                     format!("request is not valid JSON: {error}"),
                 ),
             ),
-        };
-
-        let rendered = serde_json::to_string(&response).unwrap_or_else(|error| {
-            eprintln!("memory-stdio: response serialization failed: {error}");
-            String::from(
-                r#"{"contract_version":"0.1","request_id":"","ok":false,"error":{"code":"SERIALIZATION_ERROR","message":"response serialization failed","retryable":false}}"#,
-            )
-        });
-
-        if writeln!(stdout, "{rendered}")
-            .and_then(|()| stdout.flush())
-            .is_err()
-        {
-            eprintln!("memory-stdio: stdout write failed");
-            break;
         }
+    };
+
+    let rendered = serde_json::to_string(&response).unwrap_or_else(|error| {
+        eprintln!("memory-stdio: response serialization failed: {error}");
+        String::from(
+            r#"{"contract_version":"0.1","request_id":"","ok":false,"error":{"code":"SERIALIZATION_ERROR","message":"response serialization failed","retryable":false}}"#,
+        )
+    });
+
+    if writeln!(stdout, "{rendered}")
+        .and_then(|()| stdout.flush())
+        .is_err()
+    {
+        eprintln!("memory-stdio: stdout write failed");
+        std::process::exit(2);
     }
+}
+
+/// One stdin read: the request line, plus whether anything followed it.
+enum StdinInput {
+    Line(String, std::io::Result<usize>),
+    Trailing(std::io::Result<String>),
+}
+
+/// How long a second line is given to show up before stdin is assumed idle.
+const TRAILING_INPUT_GRACE: Duration = Duration::from_millis(250);
+
+/// Reads the single request line without waiting for stdin to close.
+///
+/// Contract §5 allows exactly one request per invocation, but a client is not
+/// obliged to close stdin. A worker thread does the blocking reads, so this side
+/// can wait for the first line and then give trailing input a bounded grace
+/// period: extra non-empty input is a protocol error, an idle open stdin is not.
+/// No dependency is added; `std` threads and a bounded channel are enough.
+fn read_request() -> std::io::Result<(String, bool)> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut reader = stdin.lock();
+        let mut line = String::new();
+        let read = reader.read_line(&mut line);
+        let failed = read.is_err();
+        if tx.send(StdinInput::Line(line, read)).is_err() || failed {
+            return;
+        }
+        let mut trailing = String::new();
+        let read = reader.read_to_string(&mut trailing).map(|_| trailing);
+        let _ = tx.send(StdinInput::Trailing(read));
+    });
+
+    let (line, read) = match rx.recv() {
+        Ok(StdinInput::Line(line, read)) => (line, read),
+        _ => {
+            return Err(std::io::Error::other("stdin reader stopped"));
+        }
+    };
+    read?;
+    // A timeout or a dead reader both mean "no second line arrived in time".
+    let trailing = match rx.recv_timeout(TRAILING_INPUT_GRACE) {
+        Ok(StdinInput::Trailing(read)) => read?,
+        _ => String::new(),
+    };
+    Ok((line, !trailing.trim().is_empty()))
 }
 
 /// Resolves the SQLite path: `--db <path>` wins, `MA_SQLITE_PATH` is the fallback.
