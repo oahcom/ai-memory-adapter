@@ -31,6 +31,8 @@
 - 前置授权状态
 - 验收条件、必须返回的证据
 
+**标识边界（不可混用）：** Work Unit 是发给执行会话的自包含 prompt/handoff packet；Session Ops WorkItem 是跨会话执行连续性记录；Session 是实际 ChatGPT conversation ID；SessionLink 是经 F-13 确认的 Session↔WorkItem 关系。Work Unit 不等于 WorkItem。当前 WorkItem 尚无结构化 GitHub Issue 引用，见 [Session Ops #166](https://github.com/oahcom/chatgpt-session-ops/issues/166)。
+
 **结构化返回：** 执行身份 → 基线 → 修改 → 验证 → GitHub 证据 → 最终状态
 （COMPLETE / BLOCKED / NEEDS_REVIEW / NEEDS_OWNER_DECISION / FAILED）
 
@@ -55,6 +57,8 @@
 - Issue #2 的规划建议不构成实施授权
 - 跨仓库/跨工作项授权不可继承
 
+**当前持久化边界：** SessionLink 只表达已确认的 Session 与 WorkItem 关系，不代表 worker/reviewer/Owner 角色。角色分配和 prompt provenance 尚无独立持久化 Assignment 记录；在 #166 的契约冻结前，角色分工仍是流程约定，不能宣称已由系统强制执行。独立审查必须使用不同 Session 和不同 prompt digest；同一 GitHub 登录不等于同一执行会话。
+
 ## 4. GitHub 证据闭环
 
 ```
@@ -72,6 +76,8 @@ Issue（需求+状态）
 - PR 描述关联 Issue；测试结果可追溯
 - Review 绑定实际审查版本；PR 更新后确认审查是否仍适用
 - 不因 PR 创建关闭需求；不因提交认定验收；不因测试通过认定生产可用
+
+**证据状态提醒（2026-11-27）：** GitHub 证据闭环是目标流程，不代表端到端追溯已达标。REQ-04 #265 最近记录的 AC6 测量为 0/133 TRACEABLE，AC8 注意力/上下文切换成本仍 ABSENT；在新的精确证据完成前，本节规则不得被概括成“闭环已实现”。
 
 **Rebase / squash 变更清单核对：**
 
@@ -129,7 +135,13 @@ rebase 和 squash 后，必须核对原 PR 变更是否完整保留。无冲突�
 
 交接内容：事实基线（GitHub 实测数据）、授权状态、精确范围、验收条件、返回格式。
 
-跨会话记忆：workspace memory（日志+MEMORY.md）+ GitHub Issue/PR 证据 + conversation_search。
+跨会话记忆的当前受控路径：Session Ops 先验证 Principal、WorkItem grant 和 F-13 SessionLink；`session.context` 再从已授权的 WorkItem 范围调用 Adapter Retrieve。检索结果是 untrusted historical context，不是指令、权限、Owner 决策或当前 Issue 状态。
+
+当前缺口：
+- Session Ops 的 `MemoryAdapterClient.store` 尚无生产调用方；`session.context` 当前只负责 Retrieve。
+- Adapter MCP 尚未实现；#25 仍是设计/授权契约工作项。
+- Adapter #35/#36 和 Session Ops #165 仍有 JSONL framing / hard-bound 工作；SO E2E pin 由 #164 更新。
+- 因此跨会话记忆仍是实验能力，尚无获批的真实 Session A→Session B 写入/检索试点（Adapter #29）。
 
 ## 6. 失败处理与恢复
 
@@ -142,21 +154,33 @@ rebase 和 squash 后，必须核对原 PR 变更是否完整保留。无冲突�
 | 锁获取失败 | TimeoutError / OSError | fail-closed（P1-01），调用方决定重试 |
 | 执行 AI 回报不可信 | GitHub 实测 | 核验 Commit/PR/测试，不接受纯文字 |
 
+**安全边界：** 本节中的旧会话投递/收割和代理恢复描述属于既有工具/运维背景，不自动构成获批的 MCP 或真实 Agent Pilot I/O 路径。当前批准边界排除账号轮转、匿名回退、挑战绕过、凭据提取，以及通过 MCP 暴露 ChatGPT transport/auth/challenge 内部。任何新试点必须使用经证明合规的 Session I/O 接口；不得从旧脚本存在推断其获批。
+
 ## 7. 能力状态
 
-| 能力 | 状态 | 说明 |
+> 状态快照：2026-11-27。治理与最终验收以 AiMemoryBrainArchitecture #458 及其父需求为准；本表是证据索引，不是第二套治理状态库。当前基线：Adapter main `3c39f22`；Session Ops main `2588244`；AiMemoryBrainArchitecture main `31c1e5d`。
+
+| 能力 | 状态 | 当前证据 / 边界 |
 |---|---|---|
-| P1-01 文件锁 fail-closed | **已实现** | 合并于 f6a0434，104/104 测试通过 |
-| ChatGPT 会话投递/收割 | **已实现** | --new / 续接 / --tail，账号轮转 |
-| GitHub 证据闭环 | **已实现** | Issue/PR/Commit/Review/验收可追溯 |
-| 独立审查 | **已实现** | 独立会话、SHA 绑定、逐项判定 |
-| Owner 授权裁决 | **已实现** | ChatGPT 会话承担，结构化输出 |
-| 会话续接与恢复 | **已实现** | conv_id 续接、匿名会话补救 |
-| 工作流架构文档 | **本文档** | 首版 |
-| P1-02 中文检索优化 | **计划中** | 需新 Owner 决策 |
-| P1-03 时间偏置基准 | **计划中** | 需新 Owner 决策 |
-| 跨仓库记忆共享 | **实验中** | Adapter 实验，未生产验证 |
-| 生产部署 | **未验证** | 测试通过≠生产可用 |
+| P1-01 文件锁 fail-closed | **SUPPORTED** | 历史合并记录 f6a0434；104/104 测试记录。仍以当前主分支测试为准。 |
+| ChatGPT 会话投递/收割 | **LEGACY / NOT VERIFIED AS APPROVED I/O** | 旧工具存在不等于获批的 Agent I/O 路径；账号轮转、匿名回退及挑战处理不属于当前批准的 MCP/Pilot 边界。 |
+| 同一会话续接 | **SUPPORTED** | conversation ID 续接属于同一 Session 生命周期；不等于跨 Session 记忆恢复。 |
+| GitHub 证据闭环 | **PARTIAL** | 规则和 GitHub Issue/PR/Commit/Review 载体存在；REQ-04 #265 最新记录的 AC6 为 0/133 TRACEABLE。 |
+| 独立审查 | **PARTIAL** | 独立 Session 的流程已定义；REQ-12 #345 最新 ledger 记录 prompt-pair provenance 仍未验证，且该 ledger 尚未重新裁定。 |
+| Owner 授权裁决 | **PARTIAL** | Owner 决策记录存在；但 WorkItem→Issue 和 role Assignment 尚未结构化持久化（Session Ops #166）。记忆内容不得作为授权证据。 |
+| WorkItem ↔ GitHub Issue | **MISSING** | SO WorkItem 当前仅持久化 ID/status/timestamps；没有 primary Issue ref。设计由 Session Ops #166 承载。 |
+| Worker/Reviewer/Owner Assignment | **MISSING** | SessionLink 不包含角色和 prompt provenance；需独立 Assignment 契约，见 Session Ops #166。 |
+| Adapter Core Store/Retrieve | **SUPPORTED LOCALLY / PARTIAL CONTRACT** | Rust Core 与 JSONL executable 有测试；当前 main 的多行处理与 v0.1 framing 不一致（Adapter #35），hard bounds 缺失（Adapter #36）。PR #34 是未合并候选。 |
+| SO → Adapter Retrieve | **PARTIAL** | SO `session.context` 从已授权 SessionLink 派生 WorkItem 并调用 Adapter；真实 E2E pin 仍待更新（SO #164）。 |
+| SO → Adapter Store | **MISSING AS PRODUCTION WORKFLOW** | `MemoryAdapterClient.store` 无生产调用方；当前 `session.context` 仅 Retrieve。 |
+| Adapter MCP | **MISSING** | Adapter main 没有 rmcp dependency/server target；授权与工具契约由 Adapter #25 追踪，未授权实现/暴露。 |
+| 跨 Session 记忆共享 | **EXPERIMENTAL / PILOT BLOCKED** | Adapter #29 未形成获批真实 Session A/B 试点；不得以 Core 单测或 proxy arm 代替。 |
+| 直接进程资源边界 | **PARTIAL / HARDENING OPEN** | Adapter #36 与 SO #165 分别追踪输入/响应与 subprocess 缓冲上限；可选 `max_chars` 不是硬资源上限。 |
+| 集成 Brain 评估 Harness | **MISSING** | REQ-06 #374 仍缺 retrieval-driven integrated runtime；offline proxy 不等于真实 Brain 集成。 |
+| 注意力/上下文切换成本 | **MISSING** | REQ-04 #265 AC8 仍 ABSENT，尚无直接测量载体。 |
+| 生产部署 | **NOT VERIFIED** | 本文、单元测试和本地 E2E 均不构成生产可用性证明。 |
+
+本表中的 PARTIAL / MISSING 项不得仅凭一次 CI 通过自动升级为 SUPPORTED；必须更新对应 Issue 的精确 SHA、测试证据、独立审查和 Owner 裁决。
 
 ## 8. 变更记录
 
@@ -164,3 +188,4 @@ rebase 和 squash 后，必须核对原 PR 变更是否完整保留。无冲突�
 |---|---|---|
 | 2026-11-20 | 首版文档创建 | — |
 | 2026-11-20 | 增加 rebase / squash 变更清单核对门禁 | — |
+| 2026-11-27 | 按 #458、#265、#345 及两仓当前 main 证据重校准能力状态；澄清 Work Unit / WorkItem / SessionLink / Assignment 边界 | — |
