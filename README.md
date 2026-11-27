@@ -11,8 +11,7 @@ ChatGPT sessions have no persistent memory → context fragmentation → frequen
 ```
 Memory Adapter (Interface)
 ├── Storage (SQLite + Vector DB)
-├── Context Injection (Smart context loading)
-└── Pruning (Ebbinghaus forgetting curve)
+└── Context Injection (Smart context loading)
 ```
 
 ## Architecture
@@ -22,7 +21,6 @@ pub trait MemoryAdapter {
     async fn store(&self, entry: MemoryEntry) -> Result<EntryId>;
     async fn query(&self, query: &Query) -> Result<Vec<MemoryEntry>>;
     async fn inject_context(&self, session_id: &str) -> Result<Context>;
-    async fn prune(&self, retention_policy: &RetentionPolicy) -> Result<PruneReport>;
 }
 ```
 
@@ -40,10 +38,15 @@ Developed by ChatGPT on remote server `43.138.133.238` following AI-STD-001 spec
 ## Quick Start
 
 ```bash
-cargo build --release
+cargo build --release --bin memory-stdio
 cargo test
-./target/release/memory-adapter
+./target/release/memory-stdio --db /absolute/path/memory.sqlite3
 ```
+
+The v0.1 contract is one request per process invocation: one JSON request line
+on stdin, exactly one JSON response line on stdout, diagnostics on stderr only.
+The client does not have to close stdin; extra non-empty input is rejected with
+`INVALID_REQUEST` before any operation runs.
 
 ## Work Item scoped retrieval
 

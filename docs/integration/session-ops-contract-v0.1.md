@@ -258,6 +258,10 @@ Constraints:
 - Implementations MUST NOT interpret an absent session_id as an
   unrestricted or global search.
 
+v0.1 clarification: `session_id` is optional in `retrieve`. Omitting it means
+cross-Session retrieval inside the same `work_item_id`; it is never a global
+search. This restates the constraints above and is not a breaking change.
+
 The retrieval scope is always the explicit WorkItem.
 
 No global fallback is allowed.
