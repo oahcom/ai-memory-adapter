@@ -22,38 +22,46 @@
 
 ## 2. ChatGPT 研发执行会话
 
-执行 AI 通过 ChatGPT 会话承担具体代码核验、修改、测试和文档任务。
+执行 AI 通过 ChatGPT 会话承担具体核验、实施、测试或文档任务。会话与角色是执行载体，不自动产生 Owner 权限；同一授权主体可以承担多个明确区分的 Owner 职责，但**实施者不能把自己的会话或自审声明为独立 Reviewer**。
 
 **工作单元（Work Unit）格式：**
-- GitHub Issue/PR 链接
-- 当前仓库和分支、目标 Commit
-- 任务范围、允许/禁止修改的文件
-- 前置授权状态
-- 验收条件、必须返回的证据
+- **主 GitHub Issue 引用**：repository full name + issue number + canonical URL；GitHub Issue 是需求与状态的系统记录，不在记忆中复制其状态
+- Session Ops WorkItem ID（执行连续性聚合标识）；当前 WorkItem schema 尚无结构化 GitHub Issue 引用，二者关联目前必须显式写入 Work Unit，不能声称已持久化
+- 当前仓库、分支、目标 Commit SHA，以及关联 PR/commit/test/CI/review 链接
+- 任务范围、允许/禁止修改的文件、前置授权状态
+- 验收条件、必须返回的证据、停止/升级条件
 
-**结构化返回：** 执行身份 → 基线 → 修改 → 验证 → GitHub 证据 → 最终状态
+**四种载体不可混同：**
+- GitHub Issue：权威需求、范围、状态和验收记录
+- Session Ops WorkItem：跨执行 Session 的工作连续性聚合，不替代 GitHub Issue
+- Session：一个真实会话/执行实例，通过显式、可信的 SessionLink 关联 WorkItem
+- Work Unit：投递给执行会话的自包含任务包，不是数据库实体，也不是 WorkItem 的别名
+
+**结构化返回：** 执行身份/角色 → 基线 SHA → 修改范围 → 验证命令与原始结果 → GitHub 证据 → 独立审查（精确 head）→ Owner 裁决 → 最终状态
 （COMPLETE / BLOCKED / NEEDS_REVIEW / NEEDS_OWNER_DECISION / FAILED）
 
-**会话管理：**
-- `--new` 创建新会话投递工作单元
+**会话管理（legacy tooling，不等于获批的 MCP 工作流）：**
+- `--new` 创建会话并投递工作单元
 - `<conv_id> <prompt>` 续接已有会话
 - `--tail <conv_id>` 收割末条回复
-- 失败重试：413 → 精简包 + 新会话；thinking 失控 → 纯文本模式
+- 这些命令的存在不证明身份授权、跨会话记忆效果或端到端证据链完整；账号轮转、匿名回退及认证/挑战处理均不属于获批 MCP 工作流。
 
 ## 3. 角色分工与授权
 
 | 角色 | 承担者 | 职责 | 失败策略 |
 |---|---|---|---|
-| **Session Ops Owner** | ChatGPT 会话 | 授权裁决、验收、合并批准 | NEEDS_REVISION / REJECT |
-| **实施者** | ChatGPT 会话 | 代码修改、测试编写 | BLOCKED 范围外改动 |
-| **独立 Reviewer** | 独立 ChatGPT 会话 | 读 diff、对照范围、审查结论 | REQUEST_CHANGES / NEEDS_MORE_EVIDENCE |
-| **协调 AI** | WorkBuddy | 拆解任务、投递/收割、GitHub 回写、证据核验 | 核验失败不接受文字汇报 |
+| **Competent Owner** | 由治理记录明确授权的主体/会话 | 在授权范围内作出范围、验收和合并裁决 | NEEDS_REVISION / REJECT / ESCALATE |
+| **实施者** | 执行 ChatGPT 会话 | 仅在已授权范围内修改并验证 | BLOCKED 范围外改动 |
+| **独立 Reviewer** | 与实施者分离的会话/审查主体 | 独立读取精确 diff、挑战假设、核验测试与范围 | REQUEST_CHANGES / NEEDS_MORE_EVIDENCE |
+| **协调 AI** | WorkBuddy / 协调会话 | 拆解、调度、收集证据、回写状态；不得代替授权主体 | 核验失败不接受文字汇报 |
 
 **关键约束：**
-- 实施者不能自兼独立 Reviewer
-- 所有裁决绑定精确 Commit SHA
-- Issue #2 的规划建议不构成实施授权
-- 跨仓库/跨工作项授权不可继承
+- 角色名称或会话自称不构成权限；必须有可追溯的授权依据和范围
+- 一个主体可承担多个 Owner 职责，但同一实施者不得将自审包装成独立审查
+- 独立性必须由不同执行会话/主体及可核验审查记录证明；若工具链不能证明 prompt-pair provenance，标记 NOT_VERIFIED
+- 所有技术审查绑定精确 Commit SHA；head 变化后重新确认审查适用性
+- Issue #2 的规划建议不构成实施授权；REQ-12 #345 当前仍是 proposal，Owner 与 acceptance authority 未指定
+- 跨仓库/跨 WorkItem 授权不可继承
 
 ## 4. GitHub 证据闭环
 
@@ -68,10 +76,13 @@ Issue（需求+状态）
 ```
 
 **规则：**
-- 需求留在原 Issue；实施用窄范围 PR
-- PR 描述关联 Issue；测试结果可追溯
-- Review 绑定实际审查版本；PR 更新后确认审查是否仍适用
+- 需求留在原 GitHub Issue；实施用窄范围 PR；WorkItem 不复制或覆盖 Issue 状态
+- 每个 WorkItem 的 Work Unit 必须携带一个 canonical primary Issue（repo full name + number + URL）；当前 SO WorkItem schema 未持久化该字段，不能把 prompt 约定描述为结构化契约
+- 证据链分开记录：用户目标/Prompt provenance → WorkItem 创建与授权 → Session/SessionLink → 分支/commit → 测试与 CI → 独立 Review（精确 head）→ Owner decision
+- 任何单条边缺失都应标为 PARTIAL/NOT_VERIFIED；不能用 WorkItem↔Session 链接替代 prompt→commit provenance
+- Review 绑定实际审查版本；PR 更新后确认审查是否仍适用；Owner 裁决必须记录角色、授权范围和精确 head
 - 不因 PR 创建关闭需求；不因提交认定验收；不因测试通过认定生产可用
+- 当前 REQ-04 #265 的 prompt→commit traceability 仍为 PARTIAL：135 份 manifest 中仅 9 份同时具备 prompt hash 与 implementation commit SHA；注意力/上下文切换成本 AC8 为 ABSENT
 
 **Rebase / squash 变更清单核对：**
 
@@ -129,7 +140,7 @@ rebase 和 squash 后，必须核对原 PR 变更是否完整保留。无冲突�
 
 交接内容：事实基线（GitHub 实测数据）、授权状态、精确范围、验收条件、返回格式。
 
-跨会话记忆：workspace memory（日志+MEMORY.md）+ GitHub Issue/PR 证据 + conversation_search。
+跨会话记忆只能作为显式 WorkItem 范围内的非权威历史上下文；GitHub Issue/PR 才是需求与交付状态系统记录。记忆不能授予权限、替代当前指令、改变 Owner/验收结论或证明执行发生。WorkItem↔Issue 的结构化映射尚未实现。
 
 ## 6. 失败处理与恢复
 
@@ -144,19 +155,23 @@ rebase 和 squash 后，必须核对原 PR 变更是否完整保留。无冲突�
 
 ## 7. 能力状态
 
-| 能力 | 状态 | 说明 |
+状态词仅表示本节所列证据支持的能力，不代表整体生态验收或生产批准。
+
+| 能力 | 状态 | 可核验依据与边界 |
 |---|---|---|
-| P1-01 文件锁 fail-closed | **已实现** | 合并于 f6a0434，104/104 测试通过 |
-| ChatGPT 会话投递/收割 | **已实现** | --new / 续接 / --tail，账号轮转 |
-| GitHub 证据闭环 | **已实现** | Issue/PR/Commit/Review/验收可追溯 |
-| 独立审查 | **已实现** | 独立会话、SHA 绑定、逐项判定 |
-| Owner 授权裁决 | **已实现** | ChatGPT 会话承担，结构化输出 |
-| 会话续接与恢复 | **已实现** | conv_id 续接、匿名会话补救 |
-| 工作流架构文档 | **本文档** | 首版 |
-| P1-02 中文检索优化 | **计划中** | 需新 Owner 决策 |
-| P1-03 时间偏置基准 | **计划中** | 需新 Owner 决策 |
-| 跨仓库记忆共享 | **实验中** | Adapter 实验，未生产验证 |
-| 生产部署 | **未验证** | 测试通过≠生产可用 |
+| P1-01 文件锁 fail-closed | **SUPPORTED** | Session Ops main 包含 commit `f6a04347d24ec92b73fbfbc2dc9d0b2d4be76069`（PR #1）；历史验证 104/104 测试。此项不代表整个跨仓库交付闭环完成。 |
+| ChatGPT 会话投递/收割工具 | **PARTIAL** | SO 有会话创建、续接和收割工具/脚本；这些是 legacy session-transport 能力，不等于获批的研发工作流。账号轮转、匿名回退及认证/挑战内部机制明确排除在 MCP 与试点之外。 |
+| GitHub 证据闭环 | **PARTIAL** | GitHub Issue/PR/commit/CI/review 记录可用，但 REQ-04 #265 AC6 仅 9/135 manifests 同时具备 prompt hash 与 implementation commit SHA；AC8 注意力/上下文切换成本 ABSENT。 |
+| 独立审查 | **PARTIAL** | 有独立会话审查模式和精确 SHA 绑定规则；REQ-12 #345 要求独立性有可验证证据。Reviewer prompt-pair provenance 未验证时，不得把角色标签或 Owner 自审称为独立审查。 |
+| Owner 授权裁决 | **PARTIAL** | 仓库治理与授权记录存在，但角色由授权记录赋予，不由 ChatGPT 会话自称。REQ-12 #345 当前仍为 proposal，Accountable Owner / Acceptance Authority 均 NOT_ASSIGNED。 |
+| Session/WorkItem 连续性 | **PARTIAL** | SO main 有 WorkItem、SessionLink、授权存储和 MCP 工具；但 Adapter Store 没有已证明的 SO 生产调用方，真实 Session A/B pilot 未获批准。 |
+| WorkItem → GitHub Issue 结构化映射 | **MISSING** | 当前 SO WorkItem 记录没有 canonical repository/issue reference；目前只能在 Work Unit 中显式携带，不能声称已持久化。 |
+| Session Ops MCP | **SUPPORTED** | SO main 有独立 MCP server、OIDC JWT verifier、10 个工作流工具和受限 schema/响应；Eligible ChatGPT custom-MCP 客户端的端到端连接验收仍 **NOT_VERIFIED**。 |
+| Adapter MCP | **MISSING** | Adapter main 无 `rmcp` 依赖、MCP 模块或 server target。Adapter #25 的设计决策已接受用于开发规划，但明确未授予 source implementation、remote exposure 或 deployment 权限。 |
+| P1-02 / P1-07 中文检索 | **SUPPORTED** | Adapter commits `a5b903930d83632edbb8a70282096d0ab34d2bc5`（CJK n-gram）与 `97a8e94ea734f14c04f600c6dfb6d1297aaf0d77`（单字符 CJK unigram 过滤）及对应回归测试已在 main；重复双字 bigram 边界仍有明确未解决项。组件测试不证明真实 Agent 收益。 |
+| P1-03 检索偏置评估基准 | **SUPPORTED** | Adapter commit `7538c8c0e9502068fe4e628dca3f54508abe7674`（PR #7）加入 `tests/retrieval_bias.rs` 评估 harness；实测 older-relevant candidate recall 0/20 并触发 CHANGE_REQUIRED。它证明评估载体存在，不代表初始检索表现合格；后续候选选择修复另由 #8 跟踪。 |
+| 跨仓库记忆共享 / 真实 Agent pilot | **PARTIAL** | Adapter Core 有 WorkItem-scoped store/retrieve；SO 侧有 retrieve 路径，但无已证明的生产 Store caller。#458 的三臂真实 Agent pilot 仍需 Owner 显式批准，#374 的 policy proxy 不是 integrated Brain runtime。 |
+| 生产部署 / 生产效果 | **NOT_VERIFIED / NOT_AUTHORIZED** | 当前证据不构成生产部署、生产数据访问、真实用户收益或生产 SLO 证明；相关授权仍未授予。 |
 
 ## 8. 变更记录
 
@@ -164,3 +179,4 @@ rebase 和 squash 后，必须核对原 PR 变更是否完整保留。无冲突�
 |---|---|---|
 | 2026-11-20 | 首版文档创建 | — |
 | 2026-11-20 | 增加 rebase / squash 变更清单核对门禁 | — |
+| 2026-11-28 | 按 Adapter #37 / ecosystem #458 证据重分类能力状态与身份/证据边界 | pending PR |
