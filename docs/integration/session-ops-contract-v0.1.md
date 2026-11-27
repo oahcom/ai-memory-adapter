@@ -117,6 +117,10 @@ For v0.1:
 - No interactive prompts.
 - No build output on stdout.
 
+An empty stdin stream, a blank first line, or a malformed first request
+produces one INVALID_REQUEST response and no operation is executed. Later
+input is not used to repair an invalid first request.
+
 A successfully emitted protocol response uses process exit code 0,
 including application-level error responses.
 
@@ -272,10 +276,15 @@ v0.1 clarification: `session_id` is optional in `retrieve`. Omitting it means
 cross-Session retrieval inside the same `work_item_id`; it is never a global
 search. This restates the constraints above and is not a breaking change.
 
-v0.1 clarification: `max_chars` is optional and bounds the returned entries by
-the Unicode scalar count of each entry's `content` only. An entry that would
-exceed the remaining budget is omitted whole; `content` is never truncated. An
-absent `max_chars` means no budget.
+v0.1 clarification: `max_chars`, when present and non-null, MUST be a
+positive integer. The budget is measured by Unicode scalar values in each
+entry's `content` only. If an entry would exceed the remaining aggregate
+budget, that whole entry is omitted; content is never truncated. An absent
+or null `max_chars` means unbounded.
+
+The `max_chars` budget is not a hard resource or response-byte limit. It does
+not bound request bytes, metadata, JSON envelope bytes, or Core allocations;
+those require separate hard limits.
 
 The retrieval scope is always the explicit WorkItem.
 
@@ -356,6 +365,12 @@ several Sessions inside that WorkItem:
 `entries_omitted` counts only entries excluded because they do not fit the aggregate `max_chars` character budget. It does not include entries omitted by the `limit` result-count cap. In other words, entries not returned because the result set was truncated by `limit` are not counted in `entries_omitted`.
 
 An empty entries array is a successful result.
+
+Every returned entry's `provenance` field is a JSON object. If the stored
+record has no object at the reserved `_so_contract.provenance` location
+(including missing, null, or non-object values), the Adapter returns an empty
+object `{}`. This shape normalization does not invent or reconstruct
+historical provenance.
 
 The score represents the MA retrieval score.
 
