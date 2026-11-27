@@ -246,6 +246,7 @@ Optional:
 - session_id
 - limit, default 10
 - threshold, default 0.34
+- max_chars, no default (unbounded)
 
 Constraints:
 - work_item_id must pass identifier validation.
@@ -261,6 +262,11 @@ Constraints:
 v0.1 clarification: `session_id` is optional in `retrieve`. Omitting it means
 cross-Session retrieval inside the same `work_item_id`; it is never a global
 search. This restates the constraints above and is not a breaking change.
+
+v0.1 clarification: `max_chars` is optional and bounds the returned entries by
+the Unicode scalar count of each entry's `content` only. An entry that would
+exceed the remaining budget is omitted whole; `content` is never truncated. An
+absent `max_chars` means no budget.
 
 The retrieval scope is always the explicit WorkItem.
 

@@ -712,7 +712,9 @@ fn request_is_answered_without_closing_stdin() {
         .expect("binary must start");
     let mut stdin = child.stdin.take().expect("stdin piped");
     stdin
-        .write_all(retrieve_request("req_open", &item, None).as_bytes())
+        // read_request() frames on the newline, so the request must be terminated
+        // even though this stdin is deliberately never closed.
+        .write_all(format!("{}\n", retrieve_request("req_open", &item, None)).as_bytes())
         .expect("request must be writable");
     stdin.flush().expect("request must be flushed");
 
