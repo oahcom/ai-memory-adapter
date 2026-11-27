@@ -89,6 +89,13 @@ impl Query {
                 "query text must not be empty".into(),
             ));
         }
+        // Retrieval must have at least one scope. Never allow both identifiers
+        // to be absent, as that would permit an unbounded cross-work-item scan.
+        if self.work_item_id.is_none() && self.session_id.is_none() {
+            return Err(AdapterError::Validation(
+                "query must be scoped by work_item_id or session_id".into(),
+            ));
+        }
         if self
             .session_id
             .as_ref()

@@ -947,7 +947,7 @@ async fn store_chinese_entry(storage: &SqliteStorage, session: &str, content: &s
         .store(MemoryEntry {
             id: Uuid::new_v4(),
             session_id: session.to_string(),
-            work_item_id: None,
+            work_item_id: Some("wi-chinese-retrieval".into()),
             content: content.to_string(),
             embedding: None,
             metadata: json!({"source": "chinese-retrieval-test"}),
@@ -964,7 +964,7 @@ async fn chinese_search(storage: &SqliteStorage, text: &str, threshold: f32) -> 
         .query(&Query {
             text: text.to_string(),
             session_id: None,
-            work_item_id: None,
+            work_item_id: Some("wi-chinese-retrieval".into()),
             limit: 20,
             threshold,
         })
